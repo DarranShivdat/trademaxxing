@@ -25,11 +25,6 @@ export default function RootLayout({
               <div className="text-[11px] text-neutral-600">paper-trading monitor</div>
             </div>
             <Nav />
-            <div className="mt-auto px-3 pt-5">
-              <div className="rounded-md border border-amber-500/20 bg-amber-500/5 px-2.5 py-2 text-[11px] leading-snug text-amber-500/80">
-                Demo data — detection &amp; risk pipeline not yet wired.
-              </div>
-            </div>
           </aside>
 
           {/* Mobile top bar */}

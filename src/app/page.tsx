@@ -1,5 +1,5 @@
 import { MOCK_RULE_STATUS } from "@/lib/dashboard/mock";
-import { getInstrumentsWithQuotes, getTradeData } from "@/lib/dashboard/data";
+import { getInstrumentsWithQuotes, getRealTradeRows } from "@/lib/dashboard/data";
 import { pnlInRForDay, rMultiple } from "@/lib/dashboard/metrics";
 import {
   formatDateTime,
@@ -22,11 +22,11 @@ import {
 export const dynamic = "force-dynamic";
 
 export default async function Home() {
-  const [{ instruments, quotes }, { rows }] = await Promise.all([
+  const [{ instruments, quotes }, tradeRows] = await Promise.all([
     getInstrumentsWithQuotes(),
-    getTradeData(),
+    getRealTradeRows(),
   ]);
-  const trades = rows.map((r) => r.trade);
+  const trades = tradeRows.map((r) => r.trade);
   const quoteFor = (symbol: string) => quotes.find((q) => q.symbol === symbol);
 
   const now = new Date();
@@ -72,7 +72,7 @@ export default async function Home() {
         <StatTile
           label="Rule Status"
           value={worstRule ? worstRule.decision.verdict : "OK"}
-          sub={worstRule ? worstRule.rule : "All rules within limits"}
+          sub={`${worstRule ? worstRule.rule : "All rules within limits"} · demo`}
           tone={worstRule ? "neg" : "pos"}
         />
       </div>
@@ -163,8 +163,16 @@ export default async function Home() {
           )}
         </Card>
 
-        {/* Rule status */}
-        <Card title="Risk-Rule Status">
+        {/* Rule status — no live risk-rule monitor exists yet, so this section
+            is still demo data and is labeled as such. */}
+        <Card
+          title="Risk-Rule Status"
+          actions={
+            <span className="rounded border border-amber-500/20 bg-amber-500/5 px-1.5 py-0.5 text-[10px] font-medium uppercase tracking-wide text-amber-500/80">
+              Demo data
+            </span>
+          }
+        >
           <ul className="divide-y divide-neutral-800/60">
             {MOCK_RULE_STATUS.map((r) => (
               <li

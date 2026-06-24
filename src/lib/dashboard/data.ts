@@ -140,6 +140,27 @@ function toPaperTrade(r: {
   };
 }
 
+/** Real paper trades as TradeRow[] (trade + setup label), newest first. */
+async function fetchTradeRows(): Promise<TradeRow[]> {
+  const rows = await prisma.paperTrade.findMany({
+    orderBy: { openedAt: "desc" },
+    include: { signal: true },
+  });
+  return rows.map((r) => ({
+    trade: toPaperTrade(r),
+    setupName: setupLabel(r.signal ? parse<Setup>(r.signal.setup) : null),
+  }));
+}
+
+/**
+ * Real paper trades only — never falls back to mock. Returns [] when none have
+ * been logged, so callers can render an honest empty state (used by the
+ * Overview, where fake rows would misrepresent the account).
+ */
+export async function getRealTradeRows(): Promise<TradeRow[]> {
+  return fetchTradeRows();
+}
+
 export interface TradeData {
   rows: TradeRow[];
   /** True when no real trades exist and the mock log is shown instead. */
@@ -148,23 +169,15 @@ export interface TradeData {
 
 /**
  * Paper trades as TradeRow[] (trade + setup label). Falls back to the mock
- * trade log when no real trades have been logged yet.
+ * trade log when no real trades have been logged yet — used by the Paper Trades
+ * and Analytics pages, which flag the fallback with their own demo banner.
  */
 export async function getTradeData(): Promise<TradeData> {
-  const rows = await prisma.paperTrade.findMany({
-    orderBy: { openedAt: "desc" },
-    include: { signal: true },
-  });
-
+  const rows = await fetchTradeRows();
   if (rows.length === 0) {
     return { rows: MOCK_TRADE_ROWS, isMock: true };
   }
-
-  const tradeRows: TradeRow[] = rows.map((r) => ({
-    trade: toPaperTrade(r),
-    setupName: setupLabel(r.signal ? parse<Setup>(r.signal.setup) : null),
-  }));
-  return { rows: tradeRows, isMock: false };
+  return { rows, isMock: false };
 }
 
 export interface InstrumentQuotes {
