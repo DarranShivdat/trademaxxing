@@ -9,7 +9,7 @@
     "start": "next start",
     "lint": "next lint",
     "typecheck": "tsc --noEmit",
-    "test": "tsx --test \"src/lib/engine/__tests__/*.test.ts\"",
+    "test": "tsx --test \"src/lib/engine/__tests__/*.test.ts\" \"src/lib/backtest/__tests__/*.test.ts\"",
     "db:generate": "prisma generate",
     "db:migrate": "prisma migrate dev",
     "db:push": "prisma db push",
@@ -17,7 +17,8 @@
     "seed": "tsx scripts/seed.ts",
     "pull:candles": "tsx scripts/pull-real-candles.ts",
     "reset:candles": "tsx scripts/reset-real-candles.ts",
-    "detect": "tsx scripts/detect-signals.ts"
+    "detect": "tsx scripts/detect-signals.ts",
+    "backtest": "tsx scripts/backtest.ts"
   },
   "prisma": {
     "seed": "tsx scripts/seed.ts"
