@@ -30,6 +30,12 @@ export interface TrendPullbackOptions extends FeatureOptions {
   /** Stop buffer beyond the swing low, as a multiple of ATR. Default 0.25. */
   stopAtrMult?: number;
   /**
+   * Minimum stop distance from entry, as a multiple of ATR. The final stop is
+   * never placed closer to entry than this floor, so 1R cannot collapse to
+   * market noise when the entry closes on top of the swing low. Default 1.
+   */
+  minStopAtrMult?: number;
+  /**
    * How close (in ATR multiples) the pullback low must come to EMA20/50 to
    * count as "tagged". Default 0.5.
    */
@@ -52,6 +58,7 @@ export interface TrendPullbackOptions extends FeatureOptions {
 const DEFAULTS = {
   minRiskReward: 2,
   stopAtrMult: 0.25,
+  minStopAtrMult: 1,
   pullbackAtrMult: 0.5,
   pullbackLookback: 5,
 } as const;
@@ -97,15 +104,23 @@ export function detectTrendPullbackAt(
       f.close > f.ema20);
   if (!bullishConfirmation) return null;
 
-  // 4. Geometry: stop below the recent swing low, entry at the close.
+  // 4. Geometry: stop below the recent swing low, entry at the close — but
+  //    floored so it is never closer to entry than `minStopAtrMult` ATRs.
+  //    The structural stop sits a buffer below the swing low; the ATR floor
+  //    sits a fixed distance below entry. We take the FURTHER of the two (the
+  //    lower price for a LONG) so 1R reflects real risk, not market noise.
   const entry = f.close;
-  const stopLoss = f.lastSwingLow - f.atr14 * opts.stopAtrMult;
+  const structuralStop = f.lastSwingLow - f.atr14 * opts.stopAtrMult;
+  const atrFloorStop = entry - f.atr14 * opts.minStopAtrMult;
+  const stopLoss = Math.min(structuralStop, atrFloorStop);
   const risk = entry - stopLoss;
   if (risk <= 0) return null; // entry must sit above the protected swing low.
 
   // 5. Target: the nearest structural resistance above entry. We do NOT
   //    synthesize a target — if structure offers no overhead resistance, or the
-  //    nearest one is too close to clear minRiskReward, there is no setup.
+  //    nearest one is too close to clear minRiskReward, there is no setup. The
+  //    R:R is measured against the FINAL buffered risk, so a setup that only
+  //    cleared 2R on a microscopic raw stop is honestly rejected here.
   const structuralTarget = nearestResistanceAbove(f, entry);
   if (structuralTarget === null) return null;
   const target = structuralTarget;
@@ -148,6 +163,9 @@ export function detectTrendPullbackAt(
     entry,
     confidenceBreakdown: checks,
     structuralTarget,
+    structuralStop,
+    atrFloorStop,
+    stopAtrFloored: atrFloorStop < structuralStop,
   };
 
   return {
@@ -161,7 +179,7 @@ export function detectTrendPullbackAt(
     stopLoss,
     target,
     riskReward,
-    invalidation: `Close below swing low ${round(f.lastSwingLow)} (stop ${round(stopLoss)}) or back below EMA50 ${round(f.ema50)}.`,
+    invalidation: `Close below ATR-buffered stop ${round(stopLoss)} (swing low ${round(f.lastSwingLow)}) or back below EMA50 ${round(f.ema50)}.`,
     confidence,
     reasonCodes,
     rawFeatures,
