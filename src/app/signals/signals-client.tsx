@@ -59,6 +59,7 @@ function SignalCard({ row }: { row: SignalRow }) {
   const [explanation, setExplanation] = useState<SignalExplanation | null>(
     row.explanation,
   );
+  const [showExplanation, setShowExplanation] = useState(row.explanation != null);
   const [busy, setBusy] = useState<null | "review" | "explain">(null);
   const [error, setError] = useState<string | null>(null);
 
@@ -83,7 +84,7 @@ function SignalCard({ row }: { row: SignalRow }) {
     }
   }
 
-  async function explain() {
+  async function fetchExplanation() {
     setBusy("explain");
     setError(null);
     try {
@@ -100,11 +101,21 @@ function SignalCard({ row }: { row: SignalRow }) {
         throw new Error(data.error ?? `Explain failed (${res.status})`);
       }
       setExplanation(data.explanation);
+      setShowExplanation(true);
       if (status === "NEW") setStatus("REVIEWED");
     } catch (e) {
       setError((e as Error).message);
     } finally {
       setBusy(null);
+    }
+  }
+
+  // First click fetches; subsequent clicks just toggle visibility (no refetch).
+  function toggleExplain() {
+    if (explanation) {
+      setShowExplanation((v) => !v);
+    } else {
+      void fetchExplanation();
     }
   }
 
@@ -174,7 +185,9 @@ function SignalCard({ row }: { row: SignalRow }) {
         )}
 
         {/* LLM explanation */}
-        {explanation && <Explanation explanation={explanation} />}
+        {explanation && showExplanation && (
+          <Explanation explanation={explanation} />
+        )}
 
         {error && <div className="text-xs text-rose-400">{error}</div>}
 
@@ -185,12 +198,28 @@ function SignalCard({ row }: { row: SignalRow }) {
           <div className="flex gap-2">
             <button
               type="button"
-              onClick={explain}
+              onClick={toggleExplain}
               disabled={busy !== null}
               className="rounded-md border border-neutral-700 px-3 py-1.5 text-xs font-semibold text-neutral-300 transition-colors hover:border-sky-500/50 hover:bg-sky-500/10 hover:text-sky-300 disabled:cursor-not-allowed disabled:opacity-40"
             >
-              {busy === "explain" ? "…" : explanation ? "Re-explain" : "Explain"}
+              {busy === "explain"
+                ? "…"
+                : !explanation
+                  ? "Explain"
+                  : showExplanation
+                    ? "Hide explanation"
+                    : "Show explanation"}
             </button>
+            {explanation && (
+              <button
+                type="button"
+                onClick={fetchExplanation}
+                disabled={busy !== null}
+                className="rounded-md border border-neutral-700 px-3 py-1.5 text-xs font-semibold text-neutral-300 transition-colors hover:border-sky-500/50 hover:bg-sky-500/10 hover:text-sky-300 disabled:cursor-not-allowed disabled:opacity-40"
+              >
+                Re-explain
+              </button>
+            )}
             <button
               type="button"
               onClick={() => review("reject")}
