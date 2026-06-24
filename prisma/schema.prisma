@@ -1,0 +1,256 @@
+// Trademaxxing — foundation schema.
+//
+// Datasource: SQLite for zero-setup local development. Kept Postgres-compatible
+// by avoiding SQLite-vs-Postgres divergences:
+//   - No native `enum` types (unsupported on SQLite) -> String columns whose
+//     allowed values are enforced by the shared TypeScript union types in
+//     src/lib/types. The canonical value list lives next to each field below.
+//   - No scalar lists AND no `Json` columns (both unsupported by Prisma's
+//     SQLite connector) -> `String` columns holding serialized JSON
+//     (JSON.stringify on write, JSON.parse on read) for arrays/objects
+//     (reasonCodes, rawFeatures, entryZone, the full Setup, etc.). These map
+//     to TEXT on both SQLite and Postgres, so the column type is unchanged on
+//     a Postgres switch. (If you later want native jsonb on Postgres, change
+//     these to `Json` then — it's an opt-in migration, not required.)
+//   - Prices as Float (avoids the Prisma Decimal client wrapper). Fine for
+//     mock/paper gold prices; upgrade to Decimal when real money is involved.
+//
+// To switch to Postgres later: change `provider` below to "postgresql", point
+// DATABASE_URL at a postgres:// URL, and re-run `prisma migrate`. Nothing else
+// in this schema needs to change.
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "sqlite"
+  url      = env("DATABASE_URL")
+}
+
+// --- Identity --------------------------------------------------------------
+
+model User {
+  id        String   @id @default(cuid())
+  email     String   @unique
+  name      String?
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  paperTrades  PaperTrade[]
+  tradeNotes   TradeNote[]
+  dailyReviews DailyReview[]
+  notifications Notification[]
+
+  @@map("users")
+}
+
+// --- Reference data --------------------------------------------------------
+
+model Instrument {
+  id             String   @id @default(cuid())
+  symbol         String   @unique // e.g. "XAU/USD"
+  name           String // e.g. "Gold / US Dollar"
+  type           String // InstrumentType: FOREX | COMMODITY
+  basePrecision  Int      @default(2)
+  quotePrecision Int      @default(2)
+  active         Boolean  @default(true)
+  createdAt      DateTime @default(now())
+  updatedAt      DateTime @updatedAt
+
+  @@map("instruments")
+}
+
+// --- Market data -----------------------------------------------------------
+
+model Candle {
+  id        String   @id @default(cuid())
+  symbol    String
+  timeframe String // Timeframe: 1min | 5min | 15min | 1h | 4h | 1day
+  openTime  DateTime // candle open timestamp (UTC)
+  open      Float
+  high      Float
+  low       Float
+  close     Float
+  volume    Float    @default(0)
+  source    String   @default("seed") // "seed" | "twelve_data" | ...
+  createdAt DateTime @default(now())
+
+  // Never double-insert the same candle.
+  @@unique([symbol, timeframe, openTime])
+  @@index([symbol, timeframe, openTime])
+  @@map("candles")
+}
+
+// Indicator/feature bag for a given candle. Logic is filled by the indicators
+// agent; this is scaffolding only.
+model Feature {
+  id        String   @id @default(cuid())
+  symbol    String
+  timeframe String
+  openTime  DateTime
+  payload   String // serialized JSON: computed indicators keyed by name
+  createdAt DateTime @default(now())
+
+  @@unique([symbol, timeframe, openTime])
+  @@index([symbol, timeframe, openTime])
+  @@map("features")
+}
+
+// --- Signals & review ------------------------------------------------------
+
+model Signal {
+  id         String   @id @default(cuid())
+  symbol     String
+  timeframe  String
+  direction  String // Direction: LONG | SHORT
+  setup      String // serialized JSON: the full Setup object (entryZone, stopLoss, target, ...)
+  confidence Float    @default(0) // 0..1
+  status     String   @default("NEW") // SignalStatus: NEW | REVIEWED | EXPIRED
+  createdAt  DateTime @default(now())
+  updatedAt  DateTime @updatedAt
+
+  reviews     SignalReview[]
+  paperTrades PaperTrade[]
+
+  @@index([symbol, timeframe, createdAt])
+  @@map("signals")
+}
+
+model SignalReview {
+  id        String   @id @default(cuid())
+  signalId  String
+  reviewer  String // ReviewerType: LLM | HUMAN
+  verdict   String // e.g. APPROVED | REJECTED | NEEDS_WORK
+  rationale String?
+  raw       String? // serialized JSON: raw LLM response / structured review payload
+  createdAt DateTime @default(now())
+
+  signal Signal @relation(fields: [signalId], references: [id], onDelete: Cascade)
+
+  @@index([signalId])
+  @@map("signal_reviews")
+}
+
+// --- Paper trading ---------------------------------------------------------
+
+model PaperTrade {
+  id          String    @id @default(cuid())
+  userId      String
+  symbol      String
+  direction   String // Direction: LONG | SHORT
+  entry       Float
+  stopLoss    Float
+  target      Float
+  size        Float     @default(0)
+  riskReward  Float     @default(0)
+  status      String    @default("OPEN") // TradeStatus: OPEN | CLOSED | CANCELLED
+  openedAt    DateTime  @default(now())
+  closedAt    DateTime?
+  exitPrice   Float?
+  pnl         Float?
+  signalId    String?
+  createdAt   DateTime  @default(now())
+  updatedAt   DateTime  @updatedAt
+
+  user        User              @relation(fields: [userId], references: [id], onDelete: Cascade)
+  signal      Signal?           @relation(fields: [signalId], references: [id], onDelete: SetNull)
+  screenshots TradeScreenshot[]
+  notes       TradeNote[]
+
+  @@index([userId, status])
+  @@index([symbol])
+  @@map("paper_trades")
+}
+
+model TradeScreenshot {
+  id        String   @id @default(cuid())
+  tradeId   String
+  url       String // path or URL to the image
+  caption   String?
+  createdAt DateTime @default(now())
+
+  trade PaperTrade @relation(fields: [tradeId], references: [id], onDelete: Cascade)
+
+  @@index([tradeId])
+  @@map("trade_screenshots")
+}
+
+model TradeNote {
+  id        String   @id @default(cuid())
+  tradeId   String
+  userId    String
+  body      String
+  createdAt DateTime @default(now())
+
+  trade PaperTrade @relation(fields: [tradeId], references: [id], onDelete: Cascade)
+  user  User       @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([tradeId])
+  @@map("trade_notes")
+}
+
+// --- Reviews & risk --------------------------------------------------------
+
+model DailyReview {
+  id        String   @id @default(cuid())
+  userId    String
+  date      DateTime // the trading day under review (date at UTC midnight)
+  summary   String?
+  stats     String? // serialized JSON: aggregate stats (wins, losses, pnl, ...)
+  createdAt DateTime @default(now())
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@unique([userId, date])
+  @@index([userId, date])
+  @@map("daily_reviews")
+}
+
+model RiskEvent {
+  id        String   @id @default(cuid())
+  tradeId   String? // nullable: not every risk event is tied to a trade
+  type      String // e.g. PRE_TRADE_CHECK | DRAWDOWN_LIMIT | EXPOSURE
+  decision  String // RiskVerdict: APPROVED | REJECTED | WARNING
+  reasons   String // serialized JSON: string[] reason codes / messages
+  createdAt DateTime @default(now())
+
+  @@index([tradeId])
+  @@index([createdAt])
+  @@map("risk_events")
+}
+
+// --- External signals ------------------------------------------------------
+
+model NewsEvent {
+  id        String   @id @default(cuid())
+  symbol    String? // nullable: macro events may not map to one instrument
+  title     String
+  impact    String   @default("LOW") // NewsImpact: LOW | MEDIUM | HIGH
+  eventTime DateTime
+  source    String?
+  raw       String? // serialized JSON: raw upstream event payload
+  createdAt DateTime @default(now())
+
+  @@index([symbol, eventTime])
+  @@index([eventTime])
+  @@map("news_events")
+}
+
+model Notification {
+  id        String    @id @default(cuid())
+  userId    String? // nullable: system-wide notifications
+  channel   String    @default("console") // NotificationChannel: console | telegram | ...
+  level     String    @default("info") // NotificationLevel: info | warning | critical
+  title     String?
+  body      String
+  status    String    @default("PENDING") // NotificationStatus: PENDING | SENT | FAILED
+  sentAt    DateTime?
+  createdAt DateTime  @default(now())
+
+  user User? @relation(fields: [userId], references: [id], onDelete: SetNull)
+
+  @@index([userId])
+  @@index([status])
+  @@map("notifications")
+}
