@@ -1,9 +1,5 @@
-import {
-  MOCK_INSTRUMENTS,
-  MOCK_RULE_STATUS,
-  MOCK_TRADES,
-  quoteFor,
-} from "@/lib/dashboard/mock";
+import { MOCK_RULE_STATUS } from "@/lib/dashboard/mock";
+import { getInstrumentsWithQuotes, getTradeData } from "@/lib/dashboard/data";
 import { pnlInRForDay, rMultiple } from "@/lib/dashboard/metrics";
 import {
   formatDateTime,
@@ -23,11 +19,20 @@ import {
   signTone,
 } from "@/components/ui";
 
-export default function Home() {
+export const dynamic = "force-dynamic";
+
+export default async function Home() {
+  const [{ instruments, quotes }, { rows }] = await Promise.all([
+    getInstrumentsWithQuotes(),
+    getTradeData(),
+  ]);
+  const trades = rows.map((r) => r.trade);
+  const quoteFor = (symbol: string) => quotes.find((q) => q.symbol === symbol);
+
   const now = new Date();
-  const todayR = pnlInRForDay(MOCK_TRADES, now);
-  const openTrades = MOCK_TRADES.filter((t) => t.status === "OPEN");
-  const closedToday = MOCK_TRADES.filter(
+  const todayR = pnlInRForDay(trades, now);
+  const openTrades = trades.filter((t) => t.status === "OPEN");
+  const closedToday = trades.filter(
     (t) =>
       t.closedAt &&
       t.closedAt.getUTCDate() === now.getUTCDate() &&
@@ -57,12 +62,12 @@ export default function Home() {
         <StatTile
           label="Open Trades"
           value={openTrades.length}
-          sub={`${MOCK_INSTRUMENTS.length} instruments tracked`}
+          sub={`${instruments.length} instruments tracked`}
         />
         <StatTile
           label="Active Instruments"
-          value={MOCK_INSTRUMENTS.length}
-          sub={MOCK_INSTRUMENTS.map((i) => i.symbol).join(" · ")}
+          value={instruments.length}
+          sub={instruments.map((i) => i.symbol).join(" · ")}
         />
         <StatTile
           label="Rule Status"
@@ -85,7 +90,7 @@ export default function Home() {
             </tr>
           </thead>
           <tbody>
-            {MOCK_INSTRUMENTS.map((inst) => {
+            {instruments.map((inst) => {
               const quote = quoteFor(inst.symbol);
               return (
                 <tr key={inst.symbol} className="hover:bg-neutral-900/40">

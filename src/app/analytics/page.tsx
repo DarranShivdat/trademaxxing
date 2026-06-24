@@ -1,4 +1,4 @@
-import { MOCK_TRADE_ROWS } from "@/lib/dashboard/mock";
+import { getTradeData } from "@/lib/dashboard/data";
 import {
   computeStats,
   rMultiple,
@@ -9,11 +9,15 @@ import {
 import { formatPct, formatR, formatRatio } from "@/lib/dashboard/format";
 import { Card, StatTile, Table, Td, Th, signTone } from "@/components/ui";
 
-export default function AnalyticsPage() {
-  const stats = computeStats(MOCK_TRADE_ROWS);
+export const dynamic = "force-dynamic";
+
+export default async function AnalyticsPage() {
+  const { rows: tradeRows, isMock } = await getTradeData();
+  const stats = computeStats(tradeRows);
 
   // Cumulative-R equity curve, ordered by close time (for a sparkline).
-  const closed = MOCK_TRADE_ROWS.map((r) => r.trade)
+  const closed = tradeRows
+    .map((r) => r.trade)
     .filter((t) => t.status === "CLOSED" && t.closedAt)
     .sort((a, b) => (a.closedAt!.getTime() ?? 0) - (b.closedAt!.getTime() ?? 0));
   let cum = 0;
@@ -28,7 +32,11 @@ export default function AnalyticsPage() {
         <h1 className="text-lg font-semibold">Analytics</h1>
         <p className="text-sm text-neutral-500">
           Performance across {stats.closedTrades} closed trades.{" "}
-          <span className="text-neutral-600">(computed from mock trade log)</span>
+          {isMock && (
+            <span className="text-amber-500/80">
+              (demo data — no paper trades logged yet)
+            </span>
+          )}
         </p>
       </header>
 
@@ -82,7 +90,7 @@ export default function AnalyticsPage() {
         <Card title="By Setup">
           <ExtremesNote best={stats.bestSetup} worst={stats.worstSetup} />
           <GroupTable
-            rows={groupBy(MOCK_TRADE_ROWS, (r) => r.setupName)}
+            rows={groupBy(tradeRows, (r) => r.setupName)}
             bestKey={stats.bestSetup?.key}
             worstKey={stats.worstSetup?.key}
             header="Setup"
@@ -92,9 +100,7 @@ export default function AnalyticsPage() {
         <Card title="By Session">
           <ExtremesNote best={stats.bestSession} worst={stats.worstSession} />
           <GroupTable
-            rows={groupBy(MOCK_TRADE_ROWS, (r) =>
-              sessionLabel(r.trade.openedAt),
-            )}
+            rows={groupBy(tradeRows, (r) => sessionLabel(r.trade.openedAt))}
             bestKey={stats.bestSession?.key}
             worstKey={stats.worstSession?.key}
             header="Session"

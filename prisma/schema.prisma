@@ -107,6 +107,9 @@ model Signal {
   setup      String // serialized JSON: the full Setup object (entryZone, stopLoss, target, ...)
   confidence Float    @default(0) // 0..1
   status     String   @default("NEW") // SignalStatus: NEW | REVIEWED | EXPIRED
+  // serialized JSON: the RiskDecision (verdict + reasons) from the pre-trade
+  // risk check that let this signal survive. Null until risk-evaluated.
+  risk       String?
   createdAt  DateTime @default(now())
   updatedAt  DateTime @updatedAt
 

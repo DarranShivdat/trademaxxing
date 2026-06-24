@@ -21,12 +21,12 @@ const SYMBOL = "XAU/USD";
 
 // Minutes per timeframe, and how many bars to generate for each.
 const TIMEFRAME_SPEC: Record<Timeframe, { minutes: number; count: number }> = {
-  "1min": { minutes: 1, count: 500 },
-  "5min": { minutes: 5, count: 500 },
-  "15min": { minutes: 15, count: 400 },
-  "1h": { minutes: 60, count: 480 },
-  "4h": { minutes: 240, count: 360 },
-  "1day": { minutes: 1440, count: 365 },
+  "1min": { minutes: 1, count: 800 },
+  "5min": { minutes: 5, count: 800 },
+  "15min": { minutes: 15, count: 700 },
+  "1h": { minutes: 60, count: 700 },
+  "4h": { minutes: 240, count: 500 },
+  "1day": { minutes: 1440, count: 500 },
 };
 
 const BASE_PRICE = 2350; // rough XAU/USD level
@@ -42,8 +42,14 @@ interface MockCandle {
 
 /**
  * Generate `count` OHLCV bars ending at the most recent timeframe-aligned
- * boundary, via a bounded random walk. OHLC are internally consistent
+ * boundary, via a regime-switching random walk. OHLC are internally consistent
  * (high >= max(open, close), low <= min(open, close)).
+ *
+ * Unlike a driftless walk, the series cycles through trending and ranging
+ * regimes — so it produces the stacked-EMA uptrends and pullbacks the detection
+ * engine looks for, giving the pipeline realistic data to find setups in. The
+ * trend drift stays small relative to bar volatility, so trends still pull back
+ * rather than running in a straight line.
  */
 function generateCandles(minutes: number, count: number): MockCandle[] {
   const stepMs = minutes * 60_000;
@@ -56,11 +62,31 @@ function generateCandles(minutes: number, count: number): MockCandle[] {
   const candles: MockCandle[] = [];
   let price = BASE_PRICE;
 
+  // Regime drift per bar, refreshed every `regimeLeft` bars. Magnitude is a
+  // fraction of volatility so trends accumulate over many bars but each bar's
+  // noise can still print red candles and pullbacks.
+  let trendPerBar = 0;
+  let regimeLeft = 0;
+
   for (let i = count - 1; i >= 0; i--) {
     const openTime = new Date(lastBoundary - i * stepMs);
     const open = price;
 
-    const drift = (Math.random() - 0.5) * 2 * volatility;
+    if (regimeLeft <= 0) {
+      // New regime: ~50–150 bars. Bias toward uptrends so there is long-side
+      // material, with ranging and down stretches mixed in.
+      regimeLeft = 50 + Math.floor(Math.random() * 100);
+      const roll = Math.random();
+      const strength = (0.5 + Math.random() * 0.5) * volatility; // 0.5–1.0 × vol
+      trendPerBar = roll < 0.6 ? strength : roll < 0.85 ? -strength : 0;
+    }
+    regimeLeft -= 1;
+
+    // Noise moderately above the trend: up-legs retrace into the EMA band (the
+    // pullbacks the detector keys on) while still making distinct higher highs
+    // overhead — the resistance a 2R target needs.
+    const noise = (Math.random() - 0.5) * 1.8 * volatility;
+    const drift = trendPerBar + noise;
     const close = round2(open * (1 + drift));
 
     const wick = open * volatility * Math.random();
