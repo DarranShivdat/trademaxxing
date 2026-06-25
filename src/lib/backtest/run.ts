@@ -81,6 +81,34 @@ export interface BacktestOptions {
    * detector would compute itself. Default `{}` (engine defaults).
    */
   featureOptions?: FeatureOptions;
+  /**
+   * ENTRY-ELIGIBILITY WINDOW (out-of-sample validation). When set, a detected
+   * setup only becomes a trade if its entry bar's `openTime` falls within
+   * [from, to] (each bound inclusive; null/undefined = unbounded on that side).
+   *
+   * This does NOT slice the candle history. The engine still sees the FULL
+   * series, so indicators warm up exactly as they would live (no cold-start
+   * artifact at the window's left edge), and `detect` is still called on EVERY
+   * bar — so stateful scanners keep correct incremental state. The window is a
+   * gate applied AFTER detection: it only governs which bars may OPEN a trade.
+   * No-lookahead is untouched — detection at bar n still only sees candles[0..n].
+   *
+   * A trade opened near the window's end resolves naturally on subsequent real
+   * bars (the trade playing out, not lookahead); the entry decision — made from
+   * past bars only — is what assigns the trade to this window.
+   *
+   * Both unset (the default) ⇒ every bar is eligible ⇒ byte-identical to the
+   * un-windowed backtest.
+   */
+  from?: Date | null;
+  to?: Date | null;
+}
+
+/** Entry-window test: is `t` within [from, to]? Unset bounds are unbounded. */
+function withinWindow(t: Date, from?: Date | null, to?: Date | null): boolean {
+  if (from && t < from) return false;
+  if (to && t > to) return false;
+  return true;
 }
 
 export interface BacktestResult {
@@ -224,9 +252,14 @@ export function runBacktest(
     n++;
     // DETECTION — only ever sees [0..n] (enforced inside the engine). The
     // streamed feature[n] is itself a function of candles[0..n] only, and is
-    // yielded in index order so it lines up with bar `n`.
+    // yielded in index order so it lines up with bar `n`. We detect on EVERY
+    // bar (even outside the entry window) so stateful scanners stay correct.
     const setup = detect(candles, n, feature);
     if (!setup) continue;
+    // ENTRY-ELIGIBILITY WINDOW: a setup outside [from, to] cannot open a trade.
+    // Applied AFTER detection, so warmup, scanner state and no-lookahead are all
+    // untouched — see BacktestOptions.from/to. Unset ⇒ always eligible.
+    if (!withinWindow(candles[n].openTime, options.from, options.to)) continue;
     detected++;
 
     if (n <= openUntil) {

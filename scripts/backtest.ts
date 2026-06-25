@@ -6,10 +6,16 @@
  *   npm run backtest -- --timeframe 4h --equity 25000
  *   npm run backtest -- --setup breakout-retest          # a specific setup
  *   npm run backtest -- --setup all                      # each setup in turn
+ *   npm run backtest -- --from 2024-01-01 --to 2026-06-25  # entry window only
  *
  * Detection delegates entirely to the existing engine (no lookahead); trades
  * are simulated forward against intrabar highs/lows with stop-first resolution.
  * See src/lib/backtest/run.ts for the contract.
+ *
+ * --from / --to restrict only which bars may OPEN a trade (entry-eligibility
+ * window). The engine still sees the FULL candle history, so indicators warm up
+ * exactly as live — no cold-start artifact at the window edge — and no-lookahead
+ * is untouched. See BacktestOptions.from/to.
  */
 import { config } from "dotenv";
 config({ path: ".env.local" });
@@ -26,6 +32,21 @@ import { prisma } from "../src/lib/db";
 function arg(name: string): string | undefined {
   const i = process.argv.indexOf(`--${name}`);
   return i >= 0 ? process.argv[i + 1] : undefined;
+}
+
+/**
+ * Parse a YYYY-MM-DD CLI date into a UTC window bound. `end` bounds map to the
+ * last instant of the day so a [..→2023-12-31] / [2024-01-01→..] split is gapless
+ * and non-overlapping. Returns undefined when the arg is absent (unbounded).
+ */
+function parseDate(s: string | undefined, end = false): Date | undefined {
+  if (!s) return undefined;
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(s)) {
+    throw new Error(`Invalid date "${s}". Use YYYY-MM-DD.`);
+  }
+  const d = new Date(`${s}T${end ? "23:59:59.999" : "00:00:00.000"}Z`);
+  if (Number.isNaN(d.getTime())) throw new Error(`Invalid date "${s}".`);
+  return d;
 }
 
 /** Minimum closed trades before a win rate / edge claim means anything. */
@@ -65,6 +86,8 @@ async function main() {
   }
   const timeframe = tfArg as Timeframe;
   const equity = arg("equity");
+  const from = parseDate(arg("from"));
+  const to = parseDate(arg("to"), true);
 
   // Which setup(s) to backtest. Default trend-pullback (historical behavior);
   // "all" runs each in turn; otherwise a specific slug.
@@ -92,7 +115,7 @@ async function main() {
   }
 
   for (const def of defs) {
-    report(def, candles, symbol, timeframe, equity);
+    report(def, candles, symbol, timeframe, equity, from, to);
   }
 }
 
@@ -103,6 +126,8 @@ function report(
   symbol: string,
   timeframe: Timeframe,
   equity: string | undefined,
+  from?: Date,
+  to?: Date,
 ) {
   // Prefer the setup's stateful scanner (identical signals, scales to long
   // series); fall back to the stateless per-bar detector. Fresh per run.
@@ -113,6 +138,8 @@ function report(
   const result = runBacktest(candles, {
     accountEquity: equity ? Number(equity) : undefined,
     detect,
+    from,
+    to,
   });
   const stats = computeBacktestStats(result.trades);
 
@@ -122,6 +149,13 @@ function report(
   console.log("");
   console.log(`Backtest — ${def.label}`);
   console.log(`  ${symbol} ${timeframe}   ${start} → ${end}   ${candles.length} candles`);
+  if (from || to) {
+    const w0 = from ? from.toISOString().slice(0, 10) : start;
+    const w1 = to ? to.toISOString().slice(0, 10) : end;
+    console.log(
+      `  entry window: ${w0} → ${w1}  (full history warms indicators; only entries are gated)`,
+    );
+  }
   console.log("");
 
   console.log("Pipeline");

@@ -136,6 +136,79 @@ test("backtest fires at the same index the engine does standalone", () => {
 });
 
 // ---------------------------------------------------------------------------
+// ENTRY-ELIGIBILITY WINDOW (out-of-sample validation). The window gates which
+// bars may OPEN a trade; it must NOT slice history, change detection, or leak.
+// ---------------------------------------------------------------------------
+
+test("WINDOW: unset / all-covering window is identical to the un-windowed run", () => {
+  const full = uptrendWithPullback();
+  const base = runBacktest(full);
+  assert.ok(base.trades.length > 0, "fixture should produce a trade");
+
+  // A window spanning the entire series must change nothing.
+  const wide = runBacktest(full, {
+    from: full[0].openTime,
+    to: full[full.length - 1].openTime,
+  });
+  assert.deepEqual(wide, base, "all-covering window must equal the un-windowed run");
+});
+
+test("WINDOW: a window before the first entry yields no trades (entry gated, not detected)", () => {
+  const full = uptrendWithPullback();
+  const base = runBacktest(full);
+  const firstEntry = base.trades[0].entryTime;
+
+  // End the window one ms before the first entry — nothing is eligible.
+  const before = runBacktest(full, { to: new Date(firstEntry.getTime() - 1) });
+  assert.equal(before.trades.length, 0, "no entry should be inside the window");
+  assert.equal(before.detected, 0, "detected counts in-window setups only");
+});
+
+test("WINDOW: bounds are INCLUSIVE on both ends (clean IS→OOS boundary)", () => {
+  const full = uptrendWithPullback();
+  const base = runBacktest(full);
+  const firstEntry = base.trades[0].entryTime;
+
+  // to == entryTime → included.
+  const incl = runBacktest(full, { to: firstEntry });
+  assert.equal(incl.trades[0].entryTime.getTime(), firstEntry.getTime());
+
+  // from == entryTime → included (first trade still taken).
+  const fromIncl = runBacktest(full, { from: firstEntry });
+  assert.equal(fromIncl.trades[0].entryTime.getTime(), firstEntry.getTime());
+
+  // from one ms after entryTime → that bar excluded.
+  const after = runBacktest(full, { from: new Date(firstEntry.getTime() + 1) });
+  assert.notEqual(
+    after.trades[0]?.entryTime.getTime(),
+    firstEntry.getTime(),
+    "a from just past the entry must exclude it",
+  );
+});
+
+test("WINDOW: detection still runs on EVERY bar, regardless of the window", () => {
+  // The window must not skip detection on out-of-window bars (that would desync
+  // stateful scanners and lose warmup). A spy detector records every index it is
+  // called on — it must see all bars even when the entry window is empty.
+  const full = uptrendWithPullback();
+  const seen: number[] = [];
+  const spy = (c: Candle[], n: number): Setup | null => {
+    seen.push(n);
+    return detectTrendPullbackAt(c, n);
+  };
+  // Window entirely before the data → zero eligible bars, but full detection.
+  runBacktest(full, {
+    detect: spy,
+    to: new Date(full[0].openTime.getTime() - 1),
+  });
+  assert.deepEqual(
+    seen,
+    full.map((_, i) => i),
+    "detect must be called once per bar, in index order, even with an empty window",
+  );
+});
+
+// ---------------------------------------------------------------------------
 // INTRABAR STOP-vs-TARGET RESOLUTION.
 // ---------------------------------------------------------------------------
 
