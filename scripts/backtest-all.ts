@@ -21,6 +21,7 @@ config();
 import type { Candle, Timeframe } from "../src/lib/types";
 import { TIMEFRAMES } from "../src/lib/types";
 import { runBacktest, type BacktestTrade } from "../src/lib/backtest/run";
+import type { FeatureSet } from "../src/lib/engine/features";
 import { computeBacktestStats, profitFactorR } from "../src/lib/backtest/metrics";
 import { SETUPS, setupBySlug, type SetupDef } from "../src/lib/setups";
 import { prisma } from "../src/lib/db";
@@ -229,9 +230,15 @@ async function main() {
       const end = candles[candles.length - 1].openTime.toISOString().slice(0, 10);
 
       for (const setup of setups) {
+        // Prefer the setup's stateful scanner (identical signals, scales to long
+        // series); fall back to the stateless detector. Fresh per cell.
+        const detect = setup.makeScanner
+          ? setup.makeScanner()
+          : (c: Candle[], n: number, f?: FeatureSet | null) =>
+              setup.detect(c, n, undefined, f);
         const result = runBacktest(candles, {
           accountEquity: equity,
-          detect: (c, n, f) => setup.detect(c, n, undefined, f),
+          detect,
         });
         const stats = computeBacktestStats(result.trades);
         cells.push({
