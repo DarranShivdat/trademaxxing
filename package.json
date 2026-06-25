@@ -20,7 +20,8 @@
     "detect": "tsx scripts/detect-signals.ts",
     "backtest": "tsx scripts/backtest.ts",
     "backtest:all": "tsx scripts/backtest-all.ts",
-    "backtest:split": "tsx scripts/backtest-split.ts"
+    "backtest:split": "tsx scripts/backtest-split.ts",
+    "backtest:cost": "tsx scripts/backtest-cost.ts"
   },
   "prisma": {
     "seed": "tsx scripts/seed.ts"

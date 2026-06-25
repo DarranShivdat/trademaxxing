@@ -16,6 +16,13 @@
  * window). The engine still sees the FULL candle history, so indicators warm up
  * exactly as live — no cold-start artifact at the window edge — and no-lookahead
  * is untouched. See BacktestOptions.from/to.
+ *
+ * --cost-price / --cost-r deduct a transaction cost from EVERY trade's realized R
+ * (a pure post-trade deduction; detection and metrics are unchanged). --cost-price
+ * is spread+slippage in price units, converted to R per trade by each trade's own
+ * stop distance (the honest default); --cost-r is a flat cost in R. Omit both for
+ * a cost-free run (historical behavior). See src/lib/backtest/cost.ts; for the full
+ * cost sensitivity curve + breakeven, use `npm run backtest:cost`.
  */
 import { config } from "dotenv";
 config({ path: ".env.local" });
@@ -26,12 +33,42 @@ import { TIMEFRAMES } from "../src/lib/types";
 import { runBacktest } from "../src/lib/backtest/run";
 import type { FeatureSet } from "../src/lib/engine/features";
 import { computeBacktestStats } from "../src/lib/backtest/metrics";
+import { applyCost, type CostModel } from "../src/lib/backtest/cost";
 import { SETUPS, setupBySlug, type SetupDef } from "../src/lib/setups";
 import { prisma } from "../src/lib/db";
 
 function arg(name: string): string | undefined {
   const i = process.argv.indexOf(`--${name}`);
   return i >= 0 ? process.argv[i + 1] : undefined;
+}
+
+/**
+ * Parse --cost-price / --cost-r into a CostModel, or undefined for a cost-free
+ * run. Price is the honest default; supplying both is an error (one cost basis).
+ */
+function parseCost(): CostModel | undefined {
+  const priceArg = arg("cost-price");
+  const rArg = arg("cost-r");
+  if (priceArg !== undefined && rArg !== undefined) {
+    throw new Error("Pass only one of --cost-price or --cost-r.");
+  }
+  if (priceArg !== undefined) {
+    const v = Number(priceArg);
+    if (!Number.isFinite(v) || v < 0) throw new Error(`Invalid --cost-price "${priceArg}".`);
+    return { kind: "price", priceUnits: v };
+  }
+  if (rArg !== undefined) {
+    const v = Number(rArg);
+    if (!Number.isFinite(v) || v < 0) throw new Error(`Invalid --cost-r "${rArg}".`);
+    return { kind: "r", perTradeR: v };
+  }
+  return undefined;
+}
+
+function describeCost(cost: CostModel): string {
+  return cost.kind === "price"
+    ? `$${cost.priceUnits} spread+slippage per trade (→ R by each trade's stop distance)`
+    : `${cost.perTradeR}R flat per trade`;
 }
 
 /**
@@ -88,6 +125,7 @@ async function main() {
   const equity = arg("equity");
   const from = parseDate(arg("from"));
   const to = parseDate(arg("to"), true);
+  const cost = parseCost();
 
   // Which setup(s) to backtest. Default trend-pullback (historical behavior);
   // "all" runs each in turn; otherwise a specific slug.
@@ -115,7 +153,7 @@ async function main() {
   }
 
   for (const def of defs) {
-    report(def, candles, symbol, timeframe, equity, from, to);
+    report(def, candles, symbol, timeframe, equity, from, to, cost);
   }
 }
 
@@ -128,6 +166,7 @@ function report(
   equity: string | undefined,
   from?: Date,
   to?: Date,
+  cost?: CostModel,
 ) {
   // Prefer the setup's stateful scanner (identical signals, scales to long
   // series); fall back to the stateless per-bar detector. Fresh per run.
@@ -141,7 +180,10 @@ function report(
     from,
     to,
   });
-  const stats = computeBacktestStats(result.trades);
+  // Cost is a PURE post-trade deduction: the backtester ran cost-free, and we
+  // charge each resolved trade afterward. Detection/simulation are untouched.
+  const trades = cost ? applyCost(result.trades, cost) : result.trades;
+  const stats = computeBacktestStats(trades);
 
   const start = candles[0].openTime.toISOString().slice(0, 10);
   const end = candles[candles.length - 1].openTime.toISOString().slice(0, 10);
@@ -155,6 +197,9 @@ function report(
     console.log(
       `  entry window: ${w0} → ${w1}  (full history warms indicators; only entries are gated)`,
     );
+  }
+  if (cost) {
+    console.log(`  transaction cost: ${describeCost(cost)}  (deducted from every trade's R)`);
   }
   console.log("");
 

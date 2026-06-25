@@ -35,12 +35,37 @@ import { TIMEFRAMES } from "../src/lib/types";
 import { runBacktest, type BacktestTrade } from "../src/lib/backtest/run";
 import type { FeatureSet } from "../src/lib/engine/features";
 import { computeBacktestStats, profitFactorR } from "../src/lib/backtest/metrics";
+import { applyCost, type CostModel } from "../src/lib/backtest/cost";
 import { setupBySlug, type SetupDef } from "../src/lib/setups";
 import { prisma } from "../src/lib/db";
 
 function arg(name: string): string | undefined {
   const i = process.argv.indexOf(`--${name}`);
   return i >= 0 ? process.argv[i + 1] : undefined;
+}
+
+/**
+ * Parse --cost-price / --cost-r into a CostModel, or undefined for a cost-free
+ * run. Applied identically to BOTH windows as a post-trade deduction; for the
+ * full cost-sensitivity sweep + breakeven, use `npm run backtest:cost`.
+ */
+function parseCost(): CostModel | undefined {
+  const priceArg = arg("cost-price");
+  const rArg = arg("cost-r");
+  if (priceArg !== undefined && rArg !== undefined) {
+    throw new Error("Pass only one of --cost-price or --cost-r.");
+  }
+  if (priceArg !== undefined) {
+    const v = Number(priceArg);
+    if (!Number.isFinite(v) || v < 0) throw new Error(`Invalid --cost-price "${priceArg}".`);
+    return { kind: "price", priceUnits: v };
+  }
+  if (rArg !== undefined) {
+    const v = Number(rArg);
+    if (!Number.isFinite(v) || v < 0) throw new Error(`Invalid --cost-r "${rArg}".`);
+    return { kind: "r", perTradeR: v };
+  }
+  return undefined;
 }
 
 /**
@@ -110,6 +135,7 @@ function runWindow(
   candles: Candle[],
   equity: number | undefined,
   w: Window,
+  cost?: CostModel,
 ): WindowResult {
   // Fresh scanner per run — stateful scanners must not share state across runs.
   const detect = def.makeScanner
@@ -121,14 +147,16 @@ function runWindow(
     from: w.from,
     to: w.to,
   });
-  const stats = computeBacktestStats(result.trades);
+  // Post-trade cost deduction, applied identically to both windows when set.
+  const trades = cost ? applyCost(result.trades, cost) : result.trades;
+  const stats = computeBacktestStats(trades);
   return {
     closed: stats.closedTrades,
     open: stats.openUnresolved,
     winRate: stats.winRate,
     avgR: stats.avgR,
     expectancy: stats.expectancy,
-    profitFactor: profitFactorR(result.trades),
+    profitFactor: profitFactorR(trades),
   };
 }
 
@@ -198,6 +226,7 @@ function printCell(
 async function main() {
   const equityArg = arg("equity");
   const equity = equityArg ? Number(equityArg) : undefined;
+  const cost = parseCost();
 
   const setupSlug = arg("setup") ?? "trend-pullback";
   const def = setupBySlug(setupSlug);
@@ -237,6 +266,13 @@ async function main() {
   console.log(`  IN-SAMPLE      ${ymd(is.from)} → ${ymd(is.to)}`);
   console.log(`  OUT-OF-SAMPLE  ${ymd(oos.from)} → ${ymd(oos.to)}`);
   console.log(`  windows gate ENTRIES only; the engine sees full history (warmup + no-lookahead intact).`);
+  if (cost) {
+    const desc =
+      cost.kind === "price"
+        ? `$${cost.priceUnits} spread+slippage/trade (→R by stop distance)`
+        : `${cost.perTradeR}R flat/trade`;
+    console.log(`  transaction cost: ${desc}, deducted from every trade's R.`);
+  }
 
   for (const cell of cells) {
     const candles = await loadCandles(cell.symbol, cell.timeframe);
@@ -246,8 +282,8 @@ async function main() {
       console.log(`  No candles in DB. Pull/seed data first (npm run pull:candles).`);
       continue;
     }
-    const isR = runWindow(def, candles, equity, is);
-    const oosR = runWindow(def, candles, equity, oos);
+    const isR = runWindow(def, candles, equity, is, cost);
+    const oosR = runWindow(def, candles, equity, oos, cost);
     printCell(cell.symbol, cell.timeframe, def, candles, is, oos, isR, oosR);
   }
   console.log("");
