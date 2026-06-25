@@ -23,15 +23,21 @@
  *
  * Requires TWELVE_DATA_API_KEY in .env.local (or the environment).
  *
- * HISTORY DEPTH (free tier, single request per cell — see API probes):
- *   - 1day  is NOT output-capped: we request from 2005 and take whatever the
- *           tier serves (up to the 5000-row cap — typically a deep multi-year
- *           history). This is the rich source of trades.
- *   - 1h    is hard-capped at 5000 rows → the most recent ~7-8 months.
- *   - 15min is hard-capped at 5000 rows → the most recent ~7-8 weeks.
- *   Going deeper on the intraday frames would require paginating backwards
- *   (many more requests); 5000 rows/cell is already a substantial sample, so
- *   we take the single-request max and report exactly what landed.
+ * HISTORY DEPTH (free tier):
+ *   - 1day  is NOT output-capped: a single request from 2005 returns whatever
+ *           the tier serves (up to the 5000-row cap — a deep multi-year history).
+ *   - 1h / 15min are hard-capped at 5000 rows PER REQUEST. A single request
+ *           therefore only reaches ~7-8 months (1h) / ~7-8 weeks (15min). To go
+ *           deeper we PAGINATE backwards: successive [from,to] windows, each
+ *           sized to hold well under 5000 bars (so order=ASC never truncates),
+ *           stitched into one contiguous series via idempotent upsert. The
+ *           provider serializes + spaces every window through the ~8 req/min
+ *           limiter, so a deep pull is intentionally slow (tens of minutes).
+ *   - DEPTH POLICY is per instrument × timeframe (see INSTRUMENTS):
+ *           XAU/USD 15min+1h walk back UNTIL DRY (as deep as the tier serves —
+ *           these are the positive-expectancy cells we need to grow past 30
+ *           trades); EUR/USD and GBP/USD intraday are capped at ~2 years for
+ *           comparison without spending the whole rate budget on them.
  */
 import { config } from "dotenv";
 config({ path: ".env.local" });
@@ -40,7 +46,16 @@ config();
 import { TwelveDataProvider } from "../src/lib/providers/market-data/twelve-data";
 import { runDetection } from "../src/lib/pipeline/detect";
 import { prisma } from "../src/lib/db";
-import type { Timeframe } from "../src/lib/types";
+import type { Candle, Timeframe } from "../src/lib/types";
+
+/**
+ * Backward-walk floor for a paginated intraday pull:
+ *   - "dry"          → keep walking back until the tier returns an empty window
+ *                      (pull as deep as the data goes).
+ *   - "YYYY-MM-DD"   → stop once the series reaches this date.
+ *   - undefined      → default to DEFAULT_INTRADAY_YEARS back from now.
+ */
+type IntradayDepth = "dry" | string;
 
 interface InstrumentSpec {
   symbol: string;
@@ -49,11 +64,16 @@ interface InstrumentSpec {
   basePrecision: number;
   quotePrecision: number;
   /**
-   * Per-timeframe start-date overrides (defaults come from PULL_SPEC). Used to
-   * skip a region of bad source data for one instrument without affecting the
-   * others — see EUR/USD below.
+   * Per-timeframe start-date overrides for the SINGLE-request daily pull
+   * (default is DAILY_SINCE). Used to skip a region of bad source data for one
+   * instrument without affecting the others — see EUR/USD below.
    */
   sinceOverride?: Partial<Record<Timeframe, string>>;
+  /**
+   * Per-timeframe depth policy for the PAGINATED intraday pulls (15min / 1h).
+   * Absent timeframes fall back to a DEFAULT_INTRADAY_YEARS cap.
+   */
+  intradayDepth?: Partial<Record<Timeframe, IntradayDepth>>;
 }
 
 // Real instruments. Forex majors carry ~5 decimal places (1.13775), gold ~2
@@ -67,6 +87,10 @@ const INSTRUMENTS: InstrumentSpec[] = [
     type: "COMMODITY",
     basePrecision: 2,
     quotePrecision: 2,
+    // Gold intraday is the priority: its tiny 15min/1h samples showed positive
+    // expectancy, so we pull as deep as the tier allows to see if the edge
+    // survives a real sample size. "dry" = walk back until windows come up empty.
+    intradayDepth: { "15min": "dry", "1h": "dry" },
   },
   {
     symbol: "EUR/USD",
@@ -91,15 +115,35 @@ const INSTRUMENTS: InstrumentSpec[] = [
   },
 ];
 
-// Per-timeframe history windows, expressed as a start date so daily can reach
-// back years. `to` is always "now". The provider requests outputsize=5000, so
-// intraday frames return the most-recent 5000 rows regardless of how early the
-// start is; daily returns everything available up to that cap.
-const PULL_SPEC: { timeframe: Timeframe; since: string }[] = [
-  { timeframe: "15min", since: "2025-01-01" }, // → ~5000 rows (recent weeks)
-  { timeframe: "1h", since: "2024-01-01" }, //    → ~5000 rows (recent months)
-  { timeframe: "1day", since: "2005-01-01" }, //  → deep multi-year history
-];
+// Timeframes pulled per instrument, in priority order. 15min and 1h are pulled
+// FIRST (and, for XAU, deepest) so the gold intraday cells are complete before
+// any rate budget is spent elsewhere. 1day is a single uncapped request.
+const TIMEFRAMES_TO_PULL: Timeframe[] = ["15min", "1h", "1day"];
+
+// Start date for the single-request daily pull (overridable per instrument —
+// EUR/USD starts in 2009 to skip its corrupt 2008 prints, see below).
+const DAILY_SINCE = "2005-01-01";
+
+// Default depth cap for paginated intraday frames when an instrument doesn't
+// set an explicit policy: walk back this many years, then stop.
+const DEFAULT_INTRADAY_YEARS = 2;
+
+const DAY_MS = 24 * 60 * 60 * 1000;
+
+// Pagination window span (calendar days) per intraday timeframe. Each window is
+// sized to return WELL under the 5000-row cap (~2k bars), because order=ASC +
+// the cap would otherwise silently keep only the earliest 5000 rows of a window
+// and drop the rest. Gold/forex trade ~23h × ~5 days/wk, so:
+//   15min: 30d  ≈ 23·4·~21 ≈ 1,900 bars
+//   1h:   120d  ≈ 23·1·~85 ≈ 1,950 bars
+const WINDOW_DAYS: Partial<Record<Timeframe, number>> = {
+  "15min": 30,
+  "1h": 120,
+};
+
+// Hard ceiling on windows per cell so a misbehaving series can never loop
+// forever. 400 windows × ~7.5s ≈ 50 min — far beyond any real depth need.
+const MAX_WINDOWS_PER_CELL = 400;
 
 // A consecutive close-to-close move beyond this % is flagged as a possible
 // discontinuity. Thresholds are per-timeframe because daily bars legitimately
@@ -126,24 +170,21 @@ async function wipe(): Promise<void> {
   );
 }
 
-async function pullTimeframe(
+/**
+ * Fetch one window, retrying transient NETWORK errors (the provider already
+ * retries rate-limit 429s, but rethrows DNS/connect blips). Over a long
+ * multi-window pull a single blip shouldn't abort the run.
+ */
+async function fetchWindow(
   provider: TwelveDataProvider,
   symbol: string,
   timeframe: Timeframe,
-  since: string,
-): Promise<number> {
-  const to = new Date();
-  const from = new Date(`${since}T00:00:00Z`);
-  console.log(`PULL ${symbol} ${timeframe}: ${from.toISOString()} → ${to.toISOString()}…`);
-
-  // The provider retries on rate-limit (429) but rethrows transient network
-  // errors (DNS/connect timeouts). Over a long 9-cell pull a single blip
-  // shouldn't abort everything, so retry network failures here with backoff.
-  let candles;
+  from: Date,
+  to: Date,
+): Promise<Candle[]> {
   for (let attempt = 1; ; attempt++) {
     try {
-      candles = await provider.getCandles(symbol, timeframe, from, to);
-      break;
+      return await provider.getCandles(symbol, timeframe, from, to);
     } catch (err) {
       if (attempt >= 4) throw err;
       const wait = 5000 * attempt;
@@ -151,24 +192,120 @@ async function pullTimeframe(
       await new Promise((r) => setTimeout(r, wait));
     }
   }
-  // Candles were just wiped, so a plain create is safe (no duplicate keys).
-  for (const c of candles) {
-    await prisma.candle.create({
-      data: {
-        symbol: c.symbol,
-        timeframe: c.timeframe,
-        openTime: c.openTime,
-        open: c.open,
-        high: c.high,
-        low: c.low,
-        close: c.close,
-        volume: c.volume,
-        source: "twelve_data",
+}
+
+/**
+ * Upsert a batch of candles. Upsert (not create) so overlapping window edges
+ * and any resume/re-run are idempotent — the unique [symbol,timeframe,openTime]
+ * key collapses duplicates instead of throwing.
+ */
+async function writeCandles(rows: Candle[]): Promise<void> {
+  for (const c of rows) {
+    const data = {
+      open: c.open,
+      high: c.high,
+      low: c.low,
+      close: c.close,
+      volume: c.volume,
+      source: "twelve_data",
+    };
+    await prisma.candle.upsert({
+      where: {
+        symbol_timeframe_openTime: {
+          symbol: c.symbol,
+          timeframe: c.timeframe,
+          openTime: c.openTime,
+        },
       },
+      update: data,
+      create: { symbol: c.symbol, timeframe: c.timeframe, openTime: c.openTime, ...data },
     });
   }
+}
+
+/** Single uncapped request — used for the daily frame (not output-capped). */
+async function pullSingle(
+  provider: TwelveDataProvider,
+  symbol: string,
+  timeframe: Timeframe,
+  since: string,
+): Promise<number> {
+  const to = new Date();
+  const from = new Date(`${since}T00:00:00Z`);
+  console.log(`PULL ${symbol} ${timeframe}: ${from.toISOString()} → ${to.toISOString()} (single request)…`);
+  const candles = await fetchWindow(provider, symbol, timeframe, from, to);
+  await writeCandles(candles);
   console.log(`  wrote ${candles.length} real candles`);
   return candles.length;
+}
+
+/** Resolve the backward-walk floor date for a paginated intraday pull. */
+function intradayFloor(inst: InstrumentSpec, timeframe: Timeframe): Date {
+  const policy = inst.intradayDepth?.[timeframe];
+  if (policy === "dry") return new Date("2000-01-01T00:00:00Z"); // effectively unlimited
+  if (typeof policy === "string") return new Date(`${policy}T00:00:00Z`);
+  const d = new Date();
+  d.setUTCFullYear(d.getUTCFullYear() - DEFAULT_INTRADAY_YEARS);
+  return d;
+}
+
+/**
+ * Paginated backward walk for an intraday frame. Fetches successive [from,to]
+ * windows from now toward `floor`, stitching them into one contiguous series.
+ * Stops when a window comes back empty (hit the tier's history floor), the
+ * series reaches `floor`, or no backward progress is made.
+ */
+async function pullPaginated(
+  provider: TwelveDataProvider,
+  symbol: string,
+  timeframe: Timeframe,
+  floor: Date,
+): Promise<number> {
+  let span = WINDOW_DAYS[timeframe] ?? 30;
+  let cursor = new Date(); // upper bound of the next window ("to"), walks backward
+  let prevEarliest = Infinity;
+  let total = 0;
+
+  for (let windows = 0; windows < MAX_WINDOWS_PER_CELL; windows++) {
+    const lowerBound = (): Date => {
+      const f = new Date(cursor.getTime() - span * DAY_MS);
+      return f < floor ? new Date(floor) : f;
+    };
+    let from = lowerBound();
+    let rows = await fetchWindow(provider, symbol, timeframe, from, cursor);
+
+    // Truncation guard: a window holding ≥5000 bars was capped, so order=ASC
+    // kept only its earliest 5000 and dropped the newest. Shrink and refetch.
+    for (let guard = 0; rows.length >= 5000 && span > 2 && guard < 6; guard++) {
+      span = Math.max(2, Math.floor(span / 2));
+      from = lowerBound();
+      console.log(`  window hit the 5000-row cap — shrinking span to ${span}d and refetching`);
+      rows = await fetchWindow(provider, symbol, timeframe, from, cursor);
+    }
+
+    if (rows.length === 0) {
+      console.log(
+        `  empty window ${from.toISOString().slice(0, 10)}→${cursor.toISOString().slice(0, 10)} — history floor reached`,
+      );
+      break;
+    }
+
+    await writeCandles(rows);
+    total += rows.length;
+    const earliest = rows[0].openTime; // ASC order → first row is oldest
+    console.log(
+      `  ${symbol} ${timeframe}: +${rows.length} rows  ` +
+        `[${earliest.toISOString().slice(0, 16)} … ${cursor.toISOString().slice(0, 16)}]`,
+    );
+
+    if (earliest.getTime() <= floor.getTime()) break; // reached configured floor
+    if (earliest.getTime() >= prevEarliest) break; // no backward progress — stop
+    prevEarliest = earliest.getTime();
+    cursor = earliest; // overlap one bar into the next window; upsert dedupes it
+  }
+
+  console.log(`  wrote ${total} real candles across paginated windows`);
+  return total;
 }
 
 interface SeamCheck {
@@ -247,13 +384,25 @@ async function main(): Promise<void> {
 
   await wipe();
 
-  // --- pull real candles, one request per instrument × timeframe ---
-  // (rate-limited by the provider; this is intentionally slow.)
+  // --- pull real candles per instrument × timeframe ---
+  // Daily is one request; intraday paginates backward over many windows. Every
+  // request is rate-limited by the provider, so this is intentionally slow.
   const cells: CellResult[] = [];
   for (const inst of INSTRUMENTS) {
-    for (const { timeframe, since } of PULL_SPEC) {
-      const start = inst.sinceOverride?.[timeframe] ?? since;
-      const written = await pullTimeframe(provider, inst.symbol, timeframe, start);
+    for (const timeframe of TIMEFRAMES_TO_PULL) {
+      let written: number;
+      if (timeframe === "1day") {
+        const start = inst.sinceOverride?.[timeframe] ?? DAILY_SINCE;
+        written = await pullSingle(provider, inst.symbol, timeframe, start);
+      } else {
+        const floor = intradayFloor(inst, timeframe);
+        const mode = inst.intradayDepth?.[timeframe] === "dry" ? "until-dry" : "capped";
+        console.log(
+          `PULL ${inst.symbol} ${timeframe}: paginating back toward ` +
+            `${floor.toISOString().slice(0, 10)} (${mode})…`,
+        );
+        written = await pullPaginated(provider, inst.symbol, timeframe, floor);
+      }
       cells.push({
         symbol: inst.symbol,
         timeframe,
@@ -299,7 +448,10 @@ async function main(): Promise<void> {
   }
 
   // --- final report ---
-  const totalCandles = cells.reduce((a, c) => a + c.written, 0);
+  // Count from the continuity check (authoritative DB count) rather than
+  // `written`, which on paginated frames includes the one-bar overlaps that
+  // upsert collapsed.
+  const totalCandles = cells.reduce((a, c) => a + c.seam.count, 0);
   const totalSignals = await prisma.signal.count();
   console.log("\n================ RESULT ================");
   for (const cell of cells) {
