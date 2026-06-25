@@ -97,6 +97,29 @@ test("NO LOOKAHEAD: backtest detection equals live detection at the same index",
   }
 });
 
+test("STREAMING EQUIVALENCE: streamed-feature backtest is bit-identical to fresh per-bar detection", () => {
+  // The backtester streams feature[n] (computed incrementally, one live at a
+  // time) and feeds it to the detector. This must produce EXACTLY the result a
+  // detector that ignores the fed feature and recomputes computeFeaturesAt per
+  // bar would — i.e. streaming changed memory, not numbers. A divergence here
+  // (a desynced index, a leaked/stale feature) fails the bit-identical contract.
+  const full = uptrendWithPullback();
+
+  const streamed = runBacktest(full); // default detector: uses the streamed feature
+  const fresh = runBacktest(full, {
+    // feature=undefined forces detectTrendPullbackAt to compute fresh from
+    // candles[0..n], the independent ground truth.
+    detect: (c, n) => detectTrendPullbackAt(c, n),
+  });
+
+  assert.ok(streamed.trades.length > 0, "fixture should produce trades");
+  assert.deepEqual(
+    streamed,
+    fresh,
+    "streamed-feature backtest diverged from fresh per-bar detection — not bit-identical",
+  );
+});
+
 test("backtest fires at the same index the engine does standalone", () => {
   const full = uptrendWithPullback();
   // First index the engine fires at standalone.

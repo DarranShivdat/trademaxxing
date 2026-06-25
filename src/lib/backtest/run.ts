@@ -16,7 +16,7 @@
 import type { Candle, Setup } from "@/lib/types";
 import { detectTrendPullbackAt } from "@/lib/engine/setups/trend-pullback";
 import {
-  precomputeFeatures,
+  streamFeatures,
   type FeatureOptions,
   type FeatureSet,
 } from "@/lib/engine/features";
@@ -191,11 +191,15 @@ export function runBacktest(
   const detect =
     options.detect ?? ((c, n, f) => detectTrendPullbackAt(c, n, {}, f));
 
-  // Precompute the feature series ONCE (incrementally, no lookahead) instead of
-  // recomputing the full feature set per bar inside the detector. feature[n] is
-  // identical to computeFeaturesAt(candles, n, featureOptions) — see the
-  // equivalence test — so detection is unchanged, only faster.
-  const features = precomputeFeatures(candles, options.featureOptions ?? {});
+  // Stream the feature series incrementally (no lookahead) instead of
+  // recomputing the full feature set per bar inside the detector. We consume
+  // feature[n], detect with it, and let it be GC'd — never holding all N live
+  // (which OOMs on large series; each feature carries a growing `swings`
+  // snapshot). feature[n] is identical to the materialized
+  // precomputeFeatures(candles, featureOptions)[n] (same code path) and to
+  // computeFeaturesAt(candles, n, featureOptions) — see the equivalence tests —
+  // so detection and results are bit-identical, only bounded in memory.
+  const features = streamFeatures(candles, options.featureOptions ?? {});
 
   const trades: BacktestTrade[] = [];
   let detected = 0;
@@ -205,10 +209,13 @@ export function runBacktest(
   // Bar index through which a position is held; new entries blocked until then.
   let openUntil = -1;
 
-  for (let n = 0; n < candles.length; n++) {
+  let n = -1;
+  for (const feature of features) {
+    n++;
     // DETECTION — only ever sees [0..n] (enforced inside the engine). The
-    // precomputed feature[n] is itself a function of candles[0..n] only.
-    const setup = detect(candles, n, features[n]);
+    // streamed feature[n] is itself a function of candles[0..n] only, and is
+    // yielded in index order so it lines up with bar `n`.
+    const setup = detect(candles, n, feature);
     if (!setup) continue;
     detected++;
 

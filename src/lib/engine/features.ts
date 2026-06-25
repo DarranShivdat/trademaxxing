@@ -170,15 +170,20 @@ export function computeFeaturesAt(
 }
 
 /**
- * Compute the feature set for EVERY bar in one forward pass.
+ * Stream the feature set for EVERY bar in one forward pass, yielding `feature[n]`
+ * for `n = 0..N-1` in order and **never holding more than the current bar's
+ * feature live**. This is the streaming core both `precomputeFeatures` (which
+ * collects the whole series) and the backtester (which consumes one feature,
+ * uses it, and lets it be GC'd) are built on.
  *
- * `precomputeFeatures(candles, opts)[n]` is **identical** (deep-equal) to
+ * `[...streamFeatures(candles, opts)][n]` is **identical** (deep-equal) to
  * `computeFeaturesAt(candles, n, opts)` for every `n` — see the equivalence
  * test in features.test.ts. The difference is cost: the per-bar function
  * re-slices and recomputes every indicator over `candles[0..n]` (O(n) per bar,
- * O(n²) over a series), while this walks the series once (≈ O(n) total). The
- * backtester precomputes once and feeds `feature[n]` to each detector, so a
- * 349k-candle run no longer recomputes 349k feature sets from scratch per setup.
+ * O(n²) over a series), while this walks the series once (≈ O(n) total) and
+ * keeps only O(N) indicator arrays plus one live feature in memory — so a
+ * 159k-candle run no longer materializes 159k feature sets (each with its own
+ * growing `swings` snapshot) at once.
  *
  * NO LOOKAHEAD — preserved exactly:
  *  - EMA/ATR/RSI are causal recurrences; the full series value at `n` is a
@@ -196,17 +201,18 @@ export function computeFeaturesAt(
  * Assumes `candles` is sorted ascending by `openTime` (the candle-series
  * contract) — the same assumption the per-bar `prevSession` relies on.
  */
-export function precomputeFeatures(
+export function* streamFeatures(
   candles: Candle[],
   options: FeatureOptions = {},
-): (FeatureSet | null)[] {
+): Generator<FeatureSet | null> {
   const opts = { ...DEFAULTS, ...options };
   const N = candles.length;
-  const out: (FeatureSet | null)[] = new Array(N).fill(null);
-  if (N === 0) return out;
+  if (N === 0) return;
 
   const closes = candles.map((c) => c.close);
   // Full causal indicator series, computed once. series[n] === per-bar reading.
+  // These are O(N) numeric arrays (~8 MB at 159k bars) — the bounded state we
+  // keep for the whole walk; the per-bar FeatureSet objects are not retained.
   const ema20 = ema(closes, 20);
   const ema50 = ema(closes, 50);
   const ema200 = ema(closes, 200);
@@ -278,7 +284,7 @@ export function precomputeFeatures(
       zoneWidth,
     );
 
-    out[n] = {
+    yield {
       symbol: cur.symbol,
       timeframe: cur.timeframe,
       index: n,
@@ -292,7 +298,9 @@ export function precomputeFeatures(
       ema200: ema200[n],
       atr14: a14,
       rsi14: rsi14[n],
-      // Snapshot: `confirmed` keeps growing, so each bar gets its own copy.
+      // Snapshot: `confirmed` keeps growing, so each bar gets its own copy. In
+      // streaming use only the current bar's copy is live at a time, so this no
+      // longer accumulates O(N×swings) of retained snapshots.
       swings: confirmed.slice(),
       lastSwingHigh,
       lastSwingLow,
@@ -304,8 +312,24 @@ export function precomputeFeatures(
       patterns: detectPatterns(candles, n),
     };
   }
+}
 
-  return out;
+/**
+ * Materialize the full feature series as an array. Convenience wrapper over
+ * `streamFeatures` for callers that genuinely need random access; the result is
+ * bit-identical to streaming the same `(candles, options)` by construction (it
+ * is literally collected from it). Memory is O(N) feature objects — fine for
+ * tests and small series, but the backtester streams instead (see run.ts) to
+ * stay bounded on large series.
+ *
+ * `precomputeFeatures(candles, opts)[n]` deep-equals `computeFeaturesAt(candles,
+ * n, opts)` for every `n` — proven by the equivalence test in features.test.ts.
+ */
+export function precomputeFeatures(
+  candles: Candle[],
+  options: FeatureOptions = {},
+): (FeatureSet | null)[] {
+  return Array.from(streamFeatures(candles, options));
 }
 
 /** High/low of the most recent *prior* UTC day relative to the last candle. */
