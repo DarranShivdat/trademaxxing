@@ -18,7 +18,8 @@
     "pull:candles": "tsx scripts/pull-real-candles.ts",
     "reset:candles": "tsx scripts/reset-real-candles.ts",
     "detect": "tsx scripts/detect-signals.ts",
-    "backtest": "tsx scripts/backtest.ts"
+    "backtest": "tsx scripts/backtest.ts",
+    "backtest:all": "tsx scripts/backtest-all.ts"
   },
   "prisma": {
     "seed": "tsx scripts/seed.ts"
