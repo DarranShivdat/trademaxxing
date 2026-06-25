@@ -13,7 +13,7 @@
 //   Trade *simulation* reads candles AFTER entry — that is the trade playing
 //   out, not lookahead — and is strictly separated from detection below.
 
-import type { Candle, Setup } from "@/lib/types";
+import type { Candle, Direction, Setup } from "@/lib/types";
 import { detectTrendPullbackAt } from "@/lib/engine/setups/trend-pullback";
 import {
   streamFeatures,
@@ -26,6 +26,8 @@ export type TradeOutcome = "WIN" | "LOSS" | "OPEN";
 
 /** One simulated trade and how it resolved. R is signed: +riskReward / -1. */
 export interface BacktestTrade {
+  /** Trade direction from the setup. Stop/target geometry depends on it. */
+  direction: Direction;
   /** Index of the bar whose close we entered on. */
   entryIndex: number;
   entryTime: Date;
@@ -97,12 +99,18 @@ export interface BacktestResult {
 }
 
 /**
- * Simulate a single LONG trade forward from its entry bar.
+ * Simulate a single trade (LONG or SHORT) forward from its entry bar.
  *
  * Entry fill is the close of `entryIndex` (the confirmation candle) — exactly
- * the engine's internal entry, so risk = entry-stop is 1R and reward is the
+ * the engine's internal entry, so risk = |entry-stop| is 1R and reward is the
  * setup's riskReward. We scan from entryIndex+1 (no same-bar resolution) and
  * exit on the FIRST candle to touch stop or target.
+ *
+ * DIRECTION: for a LONG the stop sits BELOW entry and the target ABOVE, so we
+ * detect them with `low <= stopLoss` / `high >= target`. For a SHORT it is the
+ * mirror — stop ABOVE, target BELOW — so we test `high >= stopLoss` /
+ * `low <= target`. Outcome→R is unchanged (stop = LOSS −1, target = WIN
+ * +riskReward); only which price the bar must reach flips.
  *
  * INTRABAR RESOLUTION: if a single candle's range spans BOTH stop and target,
  * we resolve STOP first — the conservative worst case, since we cannot know the
@@ -115,9 +123,11 @@ export function simulateTrade(
   setup: Setup,
 ): BacktestTrade {
   const entry = candles[entryIndex].close;
-  const { stopLoss, target, riskReward, confidence } = setup;
+  const { direction, stopLoss, target, riskReward, confidence } = setup;
+  const isLong = direction === "LONG";
 
   const base: BacktestTrade = {
+    direction,
     entryIndex,
     entryTime: candles[entryIndex].openTime,
     entry,
@@ -132,8 +142,8 @@ export function simulateTrade(
 
   for (let i = entryIndex + 1; i < candles.length; i++) {
     const c = candles[i];
-    const hitStop = c.low <= stopLoss;
-    const hitTarget = c.high >= target;
+    const hitStop = isLong ? c.low <= stopLoss : c.high >= stopLoss;
+    const hitTarget = isLong ? c.high >= target : c.low <= target;
 
     if (hitStop && hitTarget) {
       // Range spans both — conservative: assume stop was reached first.

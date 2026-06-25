@@ -253,6 +253,7 @@ function rTrade(r: number): BacktestTrade {
   const stopLoss = entry - risk;
   const isWin = r > 0;
   return {
+    direction: "LONG",
     entryIndex: trSeq,
     entryTime: new Date(2026, 0, 1, trSeq),
     exitIndex: trSeq + 1,
@@ -268,10 +269,40 @@ function rTrade(r: number): BacktestTrade {
     ambiguousBar: false,
   };
 }
+
+/**
+ * SHORT counterpart of `rTrade`: stop ABOVE entry, target BELOW. A win exits at
+ * the target (below entry), a loss at the stop (above entry) — so the price-pnl
+ * path (entry−exit for a short) must still resolve to +rr / −1. risk = 10.
+ */
+function rTradeShort(r: number): BacktestTrade {
+  trSeq += 1;
+  const entry = 100;
+  const risk = 10;
+  const stopLoss = entry + risk; // above entry for a short
+  const isWin = r > 0;
+  return {
+    direction: "SHORT",
+    entryIndex: trSeq,
+    entryTime: new Date(2026, 0, 1, trSeq),
+    exitIndex: trSeq + 1,
+    exitTime: new Date(2026, 0, 1, trSeq + 1),
+    entry,
+    stopLoss,
+    target: entry - Math.abs(r) * risk, // below entry for a short
+    riskReward: Math.abs(r),
+    outcome: isWin ? "WIN" : "LOSS",
+    exitPrice: isWin ? entry - r * risk : stopLoss,
+    r: isWin ? r : -1,
+    confidence: 0.7,
+    ambiguousBar: false,
+  };
+}
 /** Unresolved (open) trade — must be excluded from every resolved metric. */
 function openTrade(): BacktestTrade {
   trSeq += 1;
   return {
+    direction: "LONG",
     entryIndex: trSeq,
     entryTime: new Date(2026, 0, 1, trSeq),
     entry: 100,
@@ -345,4 +376,99 @@ test("EMPTY / all-open: zeros not NaN; profitFactorR([]) = 0", () => {
   assert.equal(s.expectancy, 0);
   assert.equal(s.avgR, 0);
   assert.equal(profitFactorR([]), 0);
+});
+
+// ---------------------------------------------------------------------------
+// SHORT DIRECTION — the bug class that made breakout-retest / ny-reversal
+// (both trade SHORT) report contradictory metrics while trend-pullback
+// (LONG-only) stayed self-consistent. Two independent direction-blind bugs:
+//   1. simulateTrade hardcoded LONG stop/target geometry, so every short
+//      resolved as an instant ambiguous LOSS (r = -1).
+//   2. toPaperTrade booked pnl = exit-entry, so a short stopped out ABOVE entry
+//      counted as a WIN in the price-pnl path (win rate / avg R columns).
+// The two paths inverted shorts in OPPOSITE directions, leaving avgR ≈ -expect.
+// ---------------------------------------------------------------------------
+
+test("SHORT simulateTrade: target BELOW entry is a WIN (+riskReward)", () => {
+  // Short at 100, stop 105 (above), target 90 (below), rr 2. Price falls into
+  // the target without ever trading up through the stop.
+  const setup = fakeSetup({ direction: "SHORT", stopLoss: 105, target: 90 });
+  const series = candles([
+    { open: 100, high: 100, low: 100, close: 100 }, // entry bar
+    { open: 99, high: 100, low: 95, close: 96 }, // drifting down, no touch
+    { open: 96, high: 97, low: 89, close: 90 }, // low 89 <= target 90 → WIN
+  ]);
+  const trade = simulateTrade(series, 0, setup);
+  assert.equal(trade.outcome, "WIN");
+  assert.equal(trade.exitPrice, 90);
+  assert.equal(trade.r, 2);
+  assert.equal(trade.ambiguousBar, false);
+});
+
+test("SHORT simulateTrade: stop ABOVE entry is a LOSS (-1)", () => {
+  const setup = fakeSetup({ direction: "SHORT", stopLoss: 105, target: 90 });
+  const series = candles([
+    { open: 100, high: 100, low: 100, close: 100 }, // entry bar
+    { open: 101, high: 106, low: 100, close: 104 }, // high 106 >= stop 105 → LOSS
+  ]);
+  const trade = simulateTrade(series, 0, setup);
+  assert.equal(trade.outcome, "LOSS");
+  assert.equal(trade.exitPrice, 105);
+  assert.equal(trade.r, -1);
+});
+
+test("METRIC INVARIANT: reported win rate + avg win/loss must imply expectancy (shorts)", () => {
+  // A short-heavy pool with a known R distribution: 7 wins (+2R), 3 losses (-1R).
+  //   winRate 0.7, avgWinR 2, avgLossR -1
+  //   expectancy = 0.7*2 + 0.3*(-1) = 1.1 ; avgR = (14-3)/10 = 1.1
+  // Pre-fix this pool reported a flipped win rate (shorts stopped out scored as
+  // wins) and an expectancy of the OPPOSITE sign to avgR — exactly the bug.
+  const trades = [
+    ...Array.from({ length: 7 }, () => rTradeShort(2)),
+    ...Array.from({ length: 3 }, () => rTradeShort(-1)),
+  ];
+  const s = computeBacktestStats(trades);
+
+  // The reported win rate / avg win / avg loss must reconstruct the reported
+  // expectancy. This is the contradiction guard: any path that flips a short's
+  // sign breaks one side of this equality.
+  const implied = s.winRate * s.avgWinR + (1 - s.winRate) * s.avgLossR;
+  assert.ok(
+    Math.abs(implied - s.expectancy) < 1e-9,
+    `winRate ${s.winRate} · avgWinR ${s.avgWinR} + lossRate · avgLossR ${s.avgLossR} ` +
+      `= ${implied} but expectancy = ${s.expectancy}`,
+  );
+  // AvgR (price-pnl path) and Expect (R-field path) must agree, as they do for
+  // LONG-only trend-pullback. For shorts the two paths previously negated.
+  assert.ok(
+    Math.abs(s.avgR - s.expectancy) < 1e-9,
+    `avgR ${s.avgR} != expectancy ${s.expectancy} (paths disagree on shorts)`,
+  );
+  // And the concrete hand values.
+  assert.equal(s.winRate, 0.7);
+  assert.equal(s.avgWinR, 2);
+  assert.equal(s.avgLossR, -1);
+  assert.ok(Math.abs(s.expectancy - 1.1) < 1e-9);
+  assert.equal(profitFactorR(trades), (7 * 2) / 3);
+});
+
+test("METRIC INVARIANT holds for a mixed LONG+SHORT pool", () => {
+  // 2 long wins (+2), 1 long loss (-1), 2 short wins (+2), 3 short losses (-1).
+  //   wins 4 @ +2, losses 4 @ -1, n=8 → winRate .5, expectancy .5, avgR .5
+  const trades = [
+    rTrade(2),
+    rTrade(2),
+    rTrade(-1),
+    rTradeShort(2),
+    rTradeShort(2),
+    rTradeShort(-1),
+    rTradeShort(-1),
+    rTradeShort(-1),
+  ];
+  const s = computeBacktestStats(trades);
+  const implied = s.winRate * s.avgWinR + (1 - s.winRate) * s.avgLossR;
+  assert.ok(Math.abs(implied - s.expectancy) < 1e-9);
+  assert.ok(Math.abs(s.avgR - s.expectancy) < 1e-9);
+  assert.equal(s.winRate, 0.5);
+  assert.ok(Math.abs(s.expectancy - 0.5) < 1e-9);
 });

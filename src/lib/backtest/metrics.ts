@@ -1,9 +1,15 @@
 // Backtest analytics. Deliberately reuses the dashboard's `computeStats` so the
 // backtest and the live dashboard report identical formulas for win rate, avg
 // R, profit factor and max drawdown-R. We map each BacktestTrade onto the
-// `PaperTrade` shape `computeStats` expects (size = 1; pnl = exit - entry, so
-// rMultiple resolves to exactly +riskReward on a win and -1 on a loss), then
-// add expectancy, which the dashboard does not compute.
+// `PaperTrade` shape `computeStats` expects (size = 1; pnl = the DIRECTIONAL
+// price gain — exit−entry for LONG, entry−exit for SHORT — so rMultiple
+// resolves to exactly +riskReward on a win and -1 on a loss regardless of
+// direction), then add expectancy, which the dashboard does not compute.
+//
+// The directional pnl matters: `computeStats` scores a win as `pnl > 0`. A
+// SHORT that hits its stop exits ABOVE entry, so a naive `exit−entry` would be
+// positive and the loss would be miscounted as a win — inverting win rate and
+// avg R for every short-trading setup while the R-field path stayed correct.
 
 import type { PaperTrade } from "@/lib/types";
 import { computeStats, type TradeStats, type TradeRow } from "@/lib/dashboard/metrics";
@@ -27,10 +33,16 @@ export interface BacktestStats extends TradeStats {
 /** Map a resolved backtest trade onto a PaperTrade for `computeStats`. */
 function toPaperTrade(t: BacktestTrade, i: number): TradeRow {
   const closed = t.outcome !== "OPEN";
+  const directionalPnl =
+    closed && t.exitPrice !== undefined
+      ? t.direction === "LONG"
+        ? t.exitPrice - t.entry
+        : t.entry - t.exitPrice
+      : undefined;
   const trade: PaperTrade = {
     id: `bt-${i}`,
     symbol: "",
-    direction: "LONG",
+    direction: t.direction,
     entry: t.entry,
     stopLoss: t.stopLoss,
     target: t.target,
@@ -40,8 +52,8 @@ function toPaperTrade(t: BacktestTrade, i: number): TradeRow {
     openedAt: t.entryTime,
     closedAt: t.exitTime,
     exitPrice: t.exitPrice,
-    // pnl in price terms; with size 1, rMultiple = pnl / (entry-stop) = R.
-    pnl: closed && t.exitPrice !== undefined ? t.exitPrice - t.entry : undefined,
+    // Directional price pnl; with size 1, rMultiple = pnl / |entry-stop| = R.
+    pnl: directionalPnl,
     signalId: undefined,
   };
   return { trade, setupName: SETUP_NAME };
