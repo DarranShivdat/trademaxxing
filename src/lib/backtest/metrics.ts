@@ -47,6 +47,34 @@ function toPaperTrade(t: BacktestTrade, i: number): TradeRow {
   return { trade, setupName: SETUP_NAME };
 }
 
+/**
+ * Profit factor in R terms: Σ(winning R) / |Σ(losing R)|.
+ *
+ * The dashboard's `profitFactor` sums raw price pnl (exit−entry), which is fine
+ * for ONE instrument but invalid to pool across instruments: gold moves on a
+ * ~4000 price scale and EUR/USD on a ~1.0 scale, so gold trades would dominate
+ * a price-weighted combined figure. R is dimensionless (+riskReward on a win,
+ * −1 on a loss), so an R-based profit factor aggregates honestly across assets.
+ * Used by the combined backtest table; the single-cell run keeps the price-based
+ * `profitFactor` from `computeStats`.
+ *
+ * Note: a high win rate with reward >1R yields a legitimately large factor
+ * (e.g. 80% wins at +2R ⇒ (8·2)/(2·1) = 8). That is correct, not inflated.
+ */
+export function profitFactorR(trades: BacktestTrade[]): number {
+  const resolved = trades.filter((t) => t.r !== null);
+  const grossWin = resolved
+    .filter((t) => (t.r ?? 0) > 0)
+    .reduce((a, t) => a + (t.r as number), 0);
+  const grossLoss = Math.abs(
+    resolved
+      .filter((t) => (t.r ?? 0) < 0)
+      .reduce((a, t) => a + (t.r as number), 0),
+  );
+  if (grossLoss === 0) return grossWin > 0 ? Infinity : 0;
+  return grossWin / grossLoss;
+}
+
 export function computeBacktestStats(trades: BacktestTrade[]): BacktestStats {
   const rows = trades.map(toPaperTrade);
   const base = computeStats(rows);

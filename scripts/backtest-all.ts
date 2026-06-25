@@ -21,7 +21,7 @@ config();
 import type { Candle, Timeframe } from "../src/lib/types";
 import { TIMEFRAMES } from "../src/lib/types";
 import { runBacktest, type BacktestTrade } from "../src/lib/backtest/run";
-import { computeBacktestStats } from "../src/lib/backtest/metrics";
+import { computeBacktestStats, profitFactorR } from "../src/lib/backtest/metrics";
 import { SETUPS, setupBySlug, type SetupDef } from "../src/lib/setups";
 import { prisma } from "../src/lib/db";
 
@@ -63,26 +63,8 @@ function pct(x: number): string {
   return `${(x * 100).toFixed(1)}%`;
 }
 
-/**
- * Profit factor in R terms: Σ(winning R) / |Σ(losing R)|.
- *
- * The library's `profitFactor` sums raw price pnl (exit−entry), which is fine
- * for ONE instrument but invalid to pool across instruments: gold moves on a
- * ~4000 price scale and EUR/USD on a ~1.0 scale, so gold trades would dominate
- * a price-weighted combined figure. R is dimensionless (+riskReward on a win,
- * −1 on a loss), so an R-based profit factor aggregates honestly across assets.
- * We use it for every cell here so the table is internally consistent; the
- * single-cell `npm run backtest` keeps the library's price-based figure.
- */
-function profitFactorR(trades: BacktestTrade[]): number {
-  const resolved = trades.filter((t) => t.r !== null);
-  const grossWin = resolved.filter((t) => (t.r ?? 0) > 0).reduce((a, t) => a + (t.r as number), 0);
-  const grossLoss = Math.abs(
-    resolved.filter((t) => (t.r ?? 0) < 0).reduce((a, t) => a + (t.r as number), 0),
-  );
-  if (grossLoss === 0) return grossWin > 0 ? Infinity : 0;
-  return grossWin / grossLoss;
-}
+// `profitFactorR` (R-based, asset-agnostic pooling) now lives in the backtest
+// library so it is shared and unit-tested; see src/lib/backtest/metrics.ts.
 
 interface Cell {
   setup: SetupDef;

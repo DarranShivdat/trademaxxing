@@ -4,8 +4,8 @@ import type { Bar } from "@/lib/engine/__tests__/helpers";
 import { bar, candles } from "@/lib/engine/__tests__/helpers";
 import type { Candle, Setup } from "@/lib/types";
 import { detectTrendPullbackAt } from "@/lib/engine/setups/trend-pullback";
-import { runBacktest, simulateTrade } from "../run";
-import { computeBacktestStats } from "../metrics";
+import { runBacktest, simulateTrade, type BacktestTrade } from "../run";
+import { computeBacktestStats, profitFactorR } from "../metrics";
 
 /**
  * Same fixture as the engine's trend-pullback test: a steady uptrend, a swing
@@ -209,4 +209,117 @@ test("computeBacktestStats: synthetic 1W/1L gives winRate .5, expectancy .5R", (
   assert.equal(stats.expectancy, 0.5);
   assert.equal(stats.profitFactor, 2); // grossProfit 2 / grossLoss 1
   assert.equal(stats.avgR, 0.5);
+});
+
+// ---------------------------------------------------------------------------
+// METRICS — hand-built regression cases over known R sequences.
+//
+// These pin expectancy / win rate / avg R / profitFactorR to values computed
+// by hand, independent of the detector, so the formulas can't silently drift.
+// Trades are constructed directly with a known R; price fields are filled so
+// the price-derived path (computeStats: pnl = exitPrice−entry over risk) yields
+// the SAME R as the R-field path, proving the two agree.
+// ---------------------------------------------------------------------------
+
+let trSeq = 0;
+/** Resolved trade with a chosen R (win: +rr, loss: −1). risk = 10, entry = 100. */
+function rTrade(r: number): BacktestTrade {
+  trSeq += 1;
+  const entry = 100;
+  const risk = 10;
+  const stopLoss = entry - risk;
+  const isWin = r > 0;
+  return {
+    entryIndex: trSeq,
+    entryTime: new Date(2026, 0, 1, trSeq),
+    exitIndex: trSeq + 1,
+    exitTime: new Date(2026, 0, 1, trSeq + 1),
+    entry,
+    stopLoss,
+    target: entry + Math.abs(r) * risk,
+    riskReward: Math.abs(r),
+    outcome: isWin ? "WIN" : "LOSS",
+    exitPrice: isWin ? entry + r * risk : stopLoss,
+    r: isWin ? r : -1,
+    confidence: 0.7,
+    ambiguousBar: false,
+  };
+}
+/** Unresolved (open) trade — must be excluded from every resolved metric. */
+function openTrade(): BacktestTrade {
+  trSeq += 1;
+  return {
+    entryIndex: trSeq,
+    entryTime: new Date(2026, 0, 1, trSeq),
+    entry: 100,
+    stopLoss: 90,
+    target: 120,
+    riskReward: 2,
+    outcome: "OPEN",
+    r: null,
+    confidence: 0.7,
+    ambiguousBar: false,
+  };
+}
+
+test("HIGH WIN RATE EDGE: 8W(+2R)/2L(-1R) → expectancy 1.4, profitFactorR 8", () => {
+  // The flagged case. Hand math:
+  //   winRate .8, avgWinR 2, avgLossR -1
+  //   expectancy = .8*2 + .2*(-1) = 1.4 ; avgR = (16-2)/10 = 1.4
+  //   profitFactorR = (8*2)/(2*1) = 8  — large but CORRECT, not inflated.
+  const trades = [
+    ...Array.from({ length: 8 }, () => rTrade(2)),
+    ...Array.from({ length: 2 }, () => rTrade(-1)),
+  ];
+  const s = computeBacktestStats(trades);
+  assert.equal(s.winRate, 0.8);
+  assert.equal(s.avgWinR, 2);
+  assert.equal(s.avgLossR, -1);
+  assert.ok(Math.abs(s.expectancy - 1.4) < 1e-9);
+  assert.ok(Math.abs(s.avgR - 1.4) < 1e-9);
+  assert.ok(Math.abs(s.expectancy - s.avgR) < 1e-9);
+  assert.equal(profitFactorR(trades), 8);
+});
+
+test("MIXED riskReward: expectancy decomposition still equals avg R", () => {
+  // wins +3,+3,+1 ; losses -1,-1 (n=5)
+  //   avgWinR = 7/3, avgLossR = -1, winRate .6
+  //   expectancy = .6*(7/3) + .4*(-1) = 1.0 ; avgR = (7-2)/5 = 1.0
+  //   profitFactorR = 7/2 = 3.5
+  const trades = [rTrade(3), rTrade(3), rTrade(1), rTrade(-1), rTrade(-1)];
+  const s = computeBacktestStats(trades);
+  assert.ok(Math.abs(s.avgWinR - 7 / 3) < 1e-9);
+  assert.equal(s.avgLossR, -1);
+  assert.equal(s.winRate, 0.6);
+  assert.ok(Math.abs(s.expectancy - 1.0) < 1e-9);
+  assert.ok(Math.abs(s.avgR - 1.0) < 1e-9);
+  assert.ok(Math.abs(s.expectancy - s.avgR) < 1e-9);
+  assert.equal(profitFactorR(trades), 3.5);
+});
+
+test("ALL WINS: expectancy = avgWinR, profitFactorR = Infinity (no losing R)", () => {
+  const trades = [rTrade(2), rTrade(2), rTrade(2)];
+  const s = computeBacktestStats(trades);
+  assert.equal(s.winRate, 1);
+  assert.equal(s.expectancy, 2);
+  assert.equal(s.avgLossR, 0);
+  assert.equal(profitFactorR(trades), Infinity);
+});
+
+test("OPEN trades are excluded from resolved metrics and profitFactorR", () => {
+  const trades = [rTrade(2), rTrade(-1), openTrade(), openTrade()];
+  const s = computeBacktestStats(trades);
+  assert.equal(s.closedTrades, 2);
+  assert.equal(s.openUnresolved, 2);
+  assert.equal(s.winRate, 0.5);
+  assert.equal(s.expectancy, 0.5);
+  assert.equal(profitFactorR(trades), 2); // opens don't touch gross win/loss
+});
+
+test("EMPTY / all-open: zeros not NaN; profitFactorR([]) = 0", () => {
+  const s = computeBacktestStats([openTrade(), openTrade()]);
+  assert.equal(s.winRate, 0);
+  assert.equal(s.expectancy, 0);
+  assert.equal(s.avgR, 0);
+  assert.equal(profitFactorR([]), 0);
 });
