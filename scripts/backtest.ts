@@ -1,9 +1,11 @@
 /**
- * Backtest the trend-pullback strategy over real candles already in the DB and
- * print an honest results table.
+ * Backtest a single setup over real candles already in the DB and print an
+ * honest results table.
  *
  *   npm run backtest -- --symbol XAU/USD --timeframe 1h
  *   npm run backtest -- --timeframe 4h --equity 25000
+ *   npm run backtest -- --setup breakout-retest          # a specific setup
+ *   npm run backtest -- --setup all                      # each setup in turn
  *
  * Detection delegates entirely to the existing engine (no lookahead); trades
  * are simulated forward against intrabar highs/lows with stop-first resolution.
@@ -17,6 +19,7 @@ import type { Candle, Timeframe } from "../src/lib/types";
 import { TIMEFRAMES } from "../src/lib/types";
 import { runBacktest } from "../src/lib/backtest/run";
 import { computeBacktestStats } from "../src/lib/backtest/metrics";
+import { SETUPS, setupBySlug, type SetupDef } from "../src/lib/setups";
 import { prisma } from "../src/lib/db";
 
 function arg(name: string): string | undefined {
@@ -62,6 +65,22 @@ async function main() {
   const timeframe = tfArg as Timeframe;
   const equity = arg("equity");
 
+  // Which setup(s) to backtest. Default trend-pullback (historical behavior);
+  // "all" runs each in turn; otherwise a specific slug.
+  const setupArg = arg("setup") ?? "trend-pullback";
+  let defs: SetupDef[];
+  if (setupArg === "all") {
+    defs = SETUPS;
+  } else {
+    const def = setupBySlug(setupArg);
+    if (!def) {
+      throw new Error(
+        `Invalid --setup "${setupArg}". One of: ${SETUPS.map((s) => s.slug).join(", ")}, all`,
+      );
+    }
+    defs = [def];
+  }
+
   const candles = await loadCandles(symbol, timeframe);
   if (candles.length === 0) {
     console.log(
@@ -71,8 +90,22 @@ async function main() {
     return;
   }
 
+  for (const def of defs) {
+    report(def, candles, symbol, timeframe, equity);
+  }
+}
+
+/** Print a full single-setup backtest report for one instrument/timeframe. */
+function report(
+  def: SetupDef,
+  candles: Candle[],
+  symbol: string,
+  timeframe: Timeframe,
+  equity: string | undefined,
+) {
   const result = runBacktest(candles, {
     accountEquity: equity ? Number(equity) : undefined,
+    detect: (c, n) => def.detect(c, n),
   });
   const stats = computeBacktestStats(result.trades);
 
@@ -80,7 +113,7 @@ async function main() {
   const end = candles[candles.length - 1].openTime.toISOString().slice(0, 10);
 
   console.log("");
-  console.log(`Backtest — Trend Pullback`);
+  console.log(`Backtest — ${def.label}`);
   console.log(`  ${symbol} ${timeframe}   ${start} → ${end}   ${candles.length} candles`);
   console.log("");
 

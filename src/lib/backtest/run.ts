@@ -51,6 +51,13 @@ export interface BacktestOptions {
    * WARNING is a soft confidence/spread flag, not a veto, so the trade is live.
    */
   allowWarning?: boolean;
+  /**
+   * The detector to backtest. MUST honor no-lookahead: it may only read
+   * candles[0..n] (every engine detector does, by slicing internally). Default
+   * `detectTrendPullbackAt` — so existing callers and tests are unchanged. Pass
+   * another setup's detector to validate it under the same simulation.
+   */
+  detect?: (candles: Candle[], n: number) => Setup | null;
 }
 
 export interface BacktestResult {
@@ -158,6 +165,7 @@ export function runBacktest(
   const accountEquity = options.accountEquity ?? 10000;
   const riskPerTradePct = options.riskPerTradePct ?? 1;
   const allowWarning = options.allowWarning ?? true;
+  const detect = options.detect ?? detectTrendPullbackAt;
 
   const trades: BacktestTrade[] = [];
   let detected = 0;
@@ -169,7 +177,7 @@ export function runBacktest(
 
   for (let n = 0; n < candles.length; n++) {
     // DETECTION — only ever sees [0..n] (enforced inside the engine).
-    const setup = detectTrendPullbackAt(candles, n);
+    const setup = detect(candles, n);
     if (!setup) continue;
     detected++;
 

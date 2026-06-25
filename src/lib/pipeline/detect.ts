@@ -1,10 +1,12 @@
 // Detection pipeline — the glue that runs the engine over real candles.
 //
-// Loads candles from the DB, walks the series running `detectTrendPullbackAt`
-// at each index (the engine slices to candles[0..n] internally, so this honors
-// no-lookahead by construction), runs every produced Setup through
-// `evaluateRisk`, and persists the survivors as Signal rows together with the
-// RiskDecision that let them through.
+// Loads candles from the DB, walks the series running EVERY registered setup
+// detector (`SETUPS` in `@/lib/setups`: trend-pullback + breakout-retest +
+// ny-reversal) at each index (each detector slices to candles[0..n] internally,
+// so this honors no-lookahead by construction), runs every produced Setup
+// through `evaluateRisk`, and persists the survivors as Signal rows together
+// with the RiskDecision that let them through. Each signal is tagged with the
+// setup that produced it (the engine's `rawFeatures.setup`).
 //
 // This module owns NO trading logic — it only orchestrates the frozen engine
 // (detect + risk) and Prisma. It is the single source of truth shared by the
@@ -13,7 +15,7 @@
 
 import type { Candle, RiskDecision, Setup, Timeframe } from "@/lib/types";
 import { prisma } from "@/lib/db";
-import { detectTrendPullbackAt } from "@/lib/engine/setups/trend-pullback";
+import { SETUPS, setupTagOf, type SetupTag } from "@/lib/setups";
 import { evaluateRisk, type ExistingSignal, type RiskContext } from "@/lib/engine/risk";
 import { explainSignal, persistSignalExplanation } from "@/lib/llm";
 
@@ -41,6 +43,8 @@ export interface RunDetectionOptions {
 
 export interface PersistedSignalSummary {
   signalId: string;
+  /** Which setup produced this signal. */
+  setup: SetupTag;
   barTime: string;
   direction: Setup["direction"];
   confidence: number;
@@ -121,21 +125,24 @@ export async function runDetection(
   };
   const candles = await loadCandles(opts.symbol, opts.timeframe);
 
-  // Existing signals for this symbol/timeframe. Idempotency (seenBarTimes) must
+  // Existing signals for this symbol/timeframe. Idempotency (seenKeys) must
   // consider EVERY status: a signal that was since REVIEWED or EXPIRED still
-  // means we already produced one for that bar and must not re-emit it. Zone
-  // dedup fed to the risk check, however, only blocks against still-active
-  // (NEW) signals.
+  // means we already produced one for that bar+setup and must not re-emit it.
+  // The key is `${barTime}::${setupTag}` so re-running never duplicates a GIVEN
+  // setup on a bar, while still allowing a different setup to fire on the same
+  // bar. Zone dedup fed to the risk check, however, only blocks against
+  // still-active (NEW) signals — and is shared across setups so two overlapping
+  // same-direction entries dedupe regardless of which setup produced them.
   const existingRows = await prisma.signal.findMany({
     where: { symbol: opts.symbol, timeframe: opts.timeframe },
   });
   const existingSignals: ExistingSignal[] = [];
-  const seenBarTimes = new Set<string>();
+  const seenKeys = new Set<string>();
   for (const row of existingRows) {
     try {
       const setup = JSON.parse(row.setup) as Setup;
       const bt = setupBarTime(setup);
-      if (bt) seenBarTimes.add(bt);
+      if (bt) seenKeys.add(`${bt}::${setupTagOf(setup)}`);
       if (row.status === "NEW") {
         existingSignals.push({ direction: setup.direction, entryZone: setup.entryZone });
       }
@@ -158,72 +165,79 @@ export async function runDetection(
   for (let n = 0; n < candles.length; n++) {
     const bar = candles[n];
     const hour = bar.openTime.getUTCHours();
-    const setup = detectTrendPullbackAt(candles, n, {
-      // Honest execution context for confidence: London/NY hours count as a
-      // preferred session. Spread/news are unknown for historical bars.
-      context: { goodSession: hour >= 7 && hour < 21 },
-    });
-    if (!setup) continue;
-    result.detected += 1;
-
     const barTime = bar.openTime.toISOString();
-    if (seenBarTimes.has(barTime)) {
-      result.skipped += 1;
-      continue;
-    }
+    // Honest execution context for confidence: London/NY hours count as a
+    // preferred session. Spread/news are unknown for historical bars. Shared by
+    // every detector on this bar.
+    const context = { goodSession: hour >= 7 && hour < 21 };
 
-    const ctx: RiskContext = {
-      accountEquity: opts.accountEquity,
-      riskPerTradePct: opts.riskPerTradePct,
-      maxTradesPerDay: opts.maxTradesPerDay,
-      tradesToday: opts.tradesToday,
-      existingSignals,
-    };
-    const decision = evaluateRisk(setup, ctx);
-    if (decision.verdict === "REJECTED") {
-      result.rejected += 1;
-      continue;
-    }
+    // Run every registered setup at this bar, in registry order. Each may emit
+    // an independent signal; they share idempotency, zone dedup, and sizing.
+    for (const def of SETUPS) {
+      const setup = def.detect(candles, n, context);
+      if (!setup) continue;
+      result.detected += 1;
 
-    const created = await prisma.signal.create({
-      data: {
-        symbol: setup.symbol,
-        timeframe: setup.timeframe,
-        direction: setup.direction,
-        setup: JSON.stringify(setup),
-        confidence: setup.confidence,
-        status: "NEW",
-        risk: JSON.stringify(decision),
-      },
-    });
-
-    // Feed the new signal back so subsequent overlapping bars dedupe.
-    existingSignals.push({ direction: setup.direction, entryZone: setup.entryZone });
-    seenBarTimes.add(barTime);
-
-    let explained = false;
-    if (opts.explain) {
-      try {
-        const explanation = await explainSignal(setup, { model: opts.explainModel });
-        await persistSignalExplanation(created.id, explanation);
-        explained = true;
-      } catch (err) {
-        // Best-effort: a missing API key or LLM error must not fail detection.
-        console.warn(
-          `explainSignal failed for ${created.id}: ${(err as Error).message}`,
-        );
+      const seenKey = `${barTime}::${def.tag}`;
+      if (seenKeys.has(seenKey)) {
+        result.skipped += 1;
+        continue;
       }
-    }
 
-    result.persisted += 1;
-    result.signals.push({
-      signalId: created.id,
-      barTime,
-      direction: setup.direction,
-      confidence: setup.confidence,
-      verdict: decision.verdict,
-      explained,
-    });
+      const ctx: RiskContext = {
+        accountEquity: opts.accountEquity,
+        riskPerTradePct: opts.riskPerTradePct,
+        maxTradesPerDay: opts.maxTradesPerDay,
+        tradesToday: opts.tradesToday,
+        existingSignals,
+      };
+      const decision = evaluateRisk(setup, ctx);
+      if (decision.verdict === "REJECTED") {
+        result.rejected += 1;
+        continue;
+      }
+
+      const created = await prisma.signal.create({
+        data: {
+          symbol: setup.symbol,
+          timeframe: setup.timeframe,
+          direction: setup.direction,
+          setup: JSON.stringify(setup),
+          confidence: setup.confidence,
+          status: "NEW",
+          risk: JSON.stringify(decision),
+        },
+      });
+
+      // Feed the new signal back so subsequent overlapping bars/setups dedupe.
+      existingSignals.push({ direction: setup.direction, entryZone: setup.entryZone });
+      seenKeys.add(seenKey);
+
+      let explained = false;
+      if (opts.explain) {
+        try {
+          const explanation = await explainSignal(setup, { model: opts.explainModel });
+          await persistSignalExplanation(created.id, explanation);
+          explained = true;
+        } catch (err) {
+          // Best-effort: a missing API key or LLM error must not fail detection.
+          console.warn(
+            `explainSignal failed for ${created.id}: ${(err as Error).message}`,
+          );
+        }
+      }
+
+      result.persisted += 1;
+      result.signals.push({
+        signalId: created.id,
+        setup: def.tag,
+        barTime,
+        direction: setup.direction,
+        confidence: setup.confidence,
+        verdict: decision.verdict,
+        explained,
+      });
+    }
   }
 
   return result;

@@ -1,16 +1,18 @@
 /**
- * Backtest the trend-pullback strategy across EVERY instrument × timeframe in
- * the DB and print an honest combined summary.
+ * Backtest EVERY setup across EVERY instrument × timeframe in the DB and print
+ * an honest summary — broken out PER SETUP so we can see whether Breakout-Retest
+ * or NY-Reversal carry an edge SEPARATELY from Trend-Pullback.
  *
  *   npm run backtest:all
  *   npm run backtest:all -- --equity 25000
+ *   npm run backtest:all -- --setup breakout-retest     # restrict to one setup
  *
  * This is an ORCHESTRATOR only: it reuses the existing, unmodified backtest
  * library (`runBacktest` + `computeBacktestStats`) exactly as `npm run backtest`
- * does, once per cell, then POOLS every resolved trade across all cells and
- * runs the same stats function on the pool. The combined trade count is the
- * headline — a single cell may be too thin to mean anything on its own, but the
- * aggregate is what tells us whether there is an edge.
+ * does, once per (setup × instrument × timeframe) cell, then POOLS resolved
+ * trades — per setup, and finally across everything. A single cell may be too
+ * thin to mean anything on its own; the per-setup pool is what tells us whether
+ * THAT setup has an edge.
  */
 import { config } from "dotenv";
 config({ path: ".env.local" });
@@ -20,6 +22,7 @@ import type { Candle, Timeframe } from "../src/lib/types";
 import { TIMEFRAMES } from "../src/lib/types";
 import { runBacktest, type BacktestTrade } from "../src/lib/backtest/run";
 import { computeBacktestStats } from "../src/lib/backtest/metrics";
+import { SETUPS, setupBySlug, type SetupDef } from "../src/lib/setups";
 import { prisma } from "../src/lib/db";
 
 function arg(name: string): string | undefined {
@@ -82,6 +85,7 @@ function profitFactorR(trades: BacktestTrade[]): number {
 }
 
 interface Cell {
+  setup: SetupDef;
   symbol: string;
   timeframe: Timeframe;
   candles: number;
@@ -94,52 +98,8 @@ interface Cell {
   trades: BacktestTrade[];
 }
 
-async function main() {
-  const equityArg = arg("equity");
-  const equity = equityArg ? Number(equityArg) : undefined;
-
-  // Discover instruments from the candle table (every symbol that has data).
-  const symbolRows = await prisma.candle.findMany({
-    distinct: ["symbol"],
-    select: { symbol: true },
-    orderBy: { symbol: "asc" },
-  });
-  const symbols = symbolRows.map((r) => r.symbol);
-
-  if (symbols.length === 0) {
-    console.log("No candles in DB. Pull data first (npm run reset:candles).");
-    return;
-  }
-
-  const cells: Cell[] = [];
-  for (const symbol of symbols) {
-    for (const timeframe of TF_ORDER) {
-      const candles = await loadCandles(symbol, timeframe);
-      if (candles.length === 0) continue;
-
-      const result = runBacktest(candles, { accountEquity: equity });
-      const stats = computeBacktestStats(result.trades);
-      cells.push({
-        symbol,
-        timeframe,
-        candles: candles.length,
-        start: candles[0].openTime.toISOString().slice(0, 10),
-        end: candles[candles.length - 1].openTime.toISOString().slice(0, 10),
-        detected: result.detected,
-        approved: result.approved,
-        closed: stats.closedTrades,
-        open: stats.openUnresolved,
-        trades: result.trades,
-      });
-    }
-  }
-
-  console.log("");
-  console.log("Backtest — Trend Pullback · ALL instruments × timeframes");
-  console.log(`  equity ${equity ?? 10000} · risk 1%/trade · ${cells.length} cells`);
-  console.log("");
-
-  // ---- per-cell table ----
+/** Per-cell table for a set of cells (assumed same setup). */
+function printCellTable(cells: Cell[]) {
   const head =
     "  " +
     "Instrument".padEnd(9) +
@@ -175,9 +135,13 @@ async function main() {
         (cell.closed === 0 ? "  (no resolved trades)" : thin ? "  ⚠ <30" : ""),
     );
   }
-  console.log("");
+}
 
-  // ---- pipeline totals (where do setups go?) ----
+/**
+ * Pooled COMBINED stats over a set of cells, with the honesty gate. `scopeLabel`
+ * names what is being pooled (a setup, or everything).
+ */
+function printCombined(scopeLabel: string, cells: Cell[]) {
   const totDetected = cells.reduce((a, c) => a + c.detected, 0);
   const totApproved = cells.reduce((a, c) => a + c.approved, 0);
   const totOpen = cells.reduce((a, c) => a + c.open, 0);
@@ -187,11 +151,10 @@ async function main() {
   console.log(`  still open (unresolved)  ${totOpen}`);
   console.log("");
 
-  // ---- COMBINED stats over the pooled trade list ----
   const pooled = cells.flatMap((c) => c.trades);
   const combined = computeBacktestStats(pooled);
 
-  console.log("================ COMBINED (all cells pooled) ================");
+  console.log(`========= COMBINED · ${scopeLabel} (cells pooled) =========`);
   console.log(`  RESOLVED TRADES ........ ${combined.closedTrades}`);
   console.log(`  still open ............. ${combined.openUnresolved}`);
 
@@ -239,6 +202,99 @@ async function main() {
     );
   }
   console.log("=============================================================");
+}
+
+async function main() {
+  const equityArg = arg("equity");
+  const equity = equityArg ? Number(equityArg) : undefined;
+
+  // Which setup(s) to run. Default: all of them.
+  const setupArg = arg("setup");
+  let setups: SetupDef[];
+  if (!setupArg) {
+    setups = SETUPS;
+  } else {
+    const def = setupBySlug(setupArg);
+    if (!def) {
+      throw new Error(
+        `Invalid --setup "${setupArg}". One of: ${SETUPS.map((s) => s.slug).join(", ")}`,
+      );
+    }
+    setups = [def];
+  }
+
+  // Discover instruments from the candle table (every symbol that has data).
+  const symbolRows = await prisma.candle.findMany({
+    distinct: ["symbol"],
+    select: { symbol: true },
+    orderBy: { symbol: "asc" },
+  });
+  const symbols = symbolRows.map((r) => r.symbol);
+
+  if (symbols.length === 0) {
+    console.log("No candles in DB. Pull data first (npm run reset:candles).");
+    return;
+  }
+
+  // Load each instrument/timeframe's candles ONCE, then run every setup over
+  // them — detection is cheap relative to repeated DB loads.
+  const cells: Cell[] = [];
+  for (const symbol of symbols) {
+    for (const timeframe of TF_ORDER) {
+      const candles = await loadCandles(symbol, timeframe);
+      if (candles.length === 0) continue;
+      const start = candles[0].openTime.toISOString().slice(0, 10);
+      const end = candles[candles.length - 1].openTime.toISOString().slice(0, 10);
+
+      for (const setup of setups) {
+        const result = runBacktest(candles, {
+          accountEquity: equity,
+          detect: (c, n) => setup.detect(c, n),
+        });
+        const stats = computeBacktestStats(result.trades);
+        cells.push({
+          setup,
+          symbol,
+          timeframe,
+          candles: candles.length,
+          start,
+          end,
+          detected: result.detected,
+          approved: result.approved,
+          closed: stats.closedTrades,
+          open: stats.openUnresolved,
+          trades: result.trades,
+        });
+      }
+    }
+  }
+
+  console.log("");
+  console.log("Backtest — PER SETUP × instrument × timeframe");
+  console.log(
+    `  equity ${equity ?? 10000} · risk 1%/trade · ${setups.length} setup(s) · ${cells.length} cells`,
+  );
+
+  // ---- one section per setup: its cells, then its pooled combined ----
+  for (const setup of setups) {
+    const setupCells = cells.filter((c) => c.setup.tag === setup.tag);
+    console.log("");
+    console.log(`################  ${setup.label}  ################`);
+    console.log("");
+    printCellTable(setupCells);
+    console.log("");
+    printCombined(setup.label, setupCells);
+  }
+
+  // ---- grand total across ALL setups (only when more than one ran) ----
+  if (setups.length > 1) {
+    console.log("");
+    console.log("Note: the block below MIXES setups into one pool. Use it only");
+    console.log("for an overall portfolio read — the per-setup blocks above are");
+    console.log("what tell you whether each setup has an edge on its own.");
+    console.log("");
+    printCombined("ALL SETUPS", cells);
+  }
 }
 
 main()
