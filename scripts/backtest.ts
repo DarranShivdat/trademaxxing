@@ -105,7 +105,7 @@ function report(
 ) {
   const result = runBacktest(candles, {
     accountEquity: equity ? Number(equity) : undefined,
-    detect: (c, n) => def.detect(c, n),
+    detect: (c, n, f) => def.detect(c, n, undefined, f),
   });
   const stats = computeBacktestStats(result.trades);
 

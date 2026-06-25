@@ -231,7 +231,7 @@ async function main() {
       for (const setup of setups) {
         const result = runBacktest(candles, {
           accountEquity: equity,
-          detect: (c, n) => setup.detect(c, n),
+          detect: (c, n, f) => setup.detect(c, n, undefined, f),
         });
         const stats = computeBacktestStats(result.trades);
         cells.push({

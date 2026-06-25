@@ -141,7 +141,7 @@ export function computeFeaturesAt(
   );
 
   const breakOfStructure = computeBOS(cur, lastSwingHigh, lastSwingLow);
-  const patterns = detectPatterns(hist);
+  const patterns = detectPatterns(hist, hist.length - 1);
 
   return {
     symbol: cur.symbol,
@@ -167,6 +167,145 @@ export function computeFeaturesAt(
     breakOfStructure,
     patterns,
   };
+}
+
+/**
+ * Compute the feature set for EVERY bar in one forward pass.
+ *
+ * `precomputeFeatures(candles, opts)[n]` is **identical** (deep-equal) to
+ * `computeFeaturesAt(candles, n, opts)` for every `n` — see the equivalence
+ * test in features.test.ts. The difference is cost: the per-bar function
+ * re-slices and recomputes every indicator over `candles[0..n]` (O(n) per bar,
+ * O(n²) over a series), while this walks the series once (≈ O(n) total). The
+ * backtester precomputes once and feeds `feature[n]` to each detector, so a
+ * 349k-candle run no longer recomputes 349k feature sets from scratch per setup.
+ *
+ * NO LOOKAHEAD — preserved exactly:
+ *  - EMA/ATR/RSI are causal recurrences; the full series value at `n` is a
+ *    function of inputs `<= n` only, so `series[n]` equals the per-bar
+ *    `lastDefined` over the slice (identical FP ops, identical order).
+ *  - Swing pivots are revealed only when `n` reaches their `confirmedAt`
+ *    (= pivot index + swingRight). A pivot that future bars would confirm stays
+ *    invisible until those bars arrive — no future confirmation leaks into
+ *    `feature[n]`.
+ *  - S/R zones re-cluster the running *confirmed* swing window each bar, so they
+ *    never include a pivot (or touch) that isn't yet knowable at `n`.
+ *  - prevSession rolls UTC-day buckets forward; the "previous session" is the
+ *    most recently *completed* prior day, never a day still in progress.
+ *
+ * Assumes `candles` is sorted ascending by `openTime` (the candle-series
+ * contract) — the same assumption the per-bar `prevSession` relies on.
+ */
+export function precomputeFeatures(
+  candles: Candle[],
+  options: FeatureOptions = {},
+): (FeatureSet | null)[] {
+  const opts = { ...DEFAULTS, ...options };
+  const N = candles.length;
+  const out: (FeatureSet | null)[] = new Array(N).fill(null);
+  if (N === 0) return out;
+
+  const closes = candles.map((c) => c.close);
+  // Full causal indicator series, computed once. series[n] === per-bar reading.
+  const ema20 = ema(closes, 20);
+  const ema50 = ema(closes, 50);
+  const ema200 = ema(closes, 200);
+  const atr14 = atr(candles, 14);
+  const rsi14 = rsi(closes, 14);
+
+  // Every pivot in one O(n) pass, revealed forward as each confirms. `allSwings`
+  // is in pivot-index order, so `confirmedAt` is non-decreasing — a single
+  // cursor suffices.
+  const allSwings = swingPoints(candles, opts.swingLeft, opts.swingRight);
+  let swingCursor = 0;
+  const confirmed: SwingPoint[] = [];
+  const confirmedHighs: SwingPoint[] = [];
+  const confirmedLows: SwingPoint[] = [];
+  let lastSwingHigh: number | null = null;
+  let lastSwingLow: number | null = null;
+
+  // Previous-UTC-day high/low, maintained as we cross day boundaries.
+  let curDay = utcDay(candles[0].openTime);
+  let curDayHi = -Infinity;
+  let curDayLo = Infinity;
+  let prevSessionHigh: number | null = null;
+  let prevSessionLow: number | null = null;
+
+  for (let n = 0; n < N; n++) {
+    const cur = candles[n];
+
+    // prevSession: when the day changes, the day we just finished becomes the
+    // previous session; then fold the current bar into the (new) day bucket.
+    const day = utcDay(cur.openTime);
+    if (day !== curDay) {
+      prevSessionHigh = curDayHi;
+      prevSessionLow = curDayLo;
+      curDay = day;
+      curDayHi = -Infinity;
+      curDayLo = Infinity;
+    }
+    if (cur.high > curDayHi) curDayHi = cur.high;
+    if (cur.low < curDayLo) curDayLo = cur.low;
+
+    // Reveal pivots that confirm at or before this bar (HIGH before LOW at a
+    // tie, matching swingPoints' push order).
+    while (
+      swingCursor < allSwings.length &&
+      allSwings[swingCursor].confirmedAt <= n
+    ) {
+      const s = allSwings[swingCursor];
+      confirmed.push(s);
+      if (s.type === "HIGH") {
+        confirmedHighs.push(s);
+        lastSwingHigh = s.price;
+      } else {
+        confirmedLows.push(s);
+        lastSwingLow = s.price;
+      }
+      swingCursor++;
+    }
+
+    const a14 = atr14[n];
+    const zoneWidth = a14 !== null ? a14 * opts.zoneAtrMult : undefined;
+    const resistanceZones = clusterZones(
+      confirmedHighs.slice(-opts.zoneLookback),
+      "RESISTANCE",
+      zoneWidth,
+    );
+    const supportZones = clusterZones(
+      confirmedLows.slice(-opts.zoneLookback),
+      "SUPPORT",
+      zoneWidth,
+    );
+
+    out[n] = {
+      symbol: cur.symbol,
+      timeframe: cur.timeframe,
+      index: n,
+      time: cur.openTime,
+      open: cur.open,
+      high: cur.high,
+      low: cur.low,
+      close: cur.close,
+      ema20: ema20[n],
+      ema50: ema50[n],
+      ema200: ema200[n],
+      atr14: a14,
+      rsi14: rsi14[n],
+      // Snapshot: `confirmed` keeps growing, so each bar gets its own copy.
+      swings: confirmed.slice(),
+      lastSwingHigh,
+      lastSwingLow,
+      prevSessionHigh,
+      prevSessionLow,
+      supportZones,
+      resistanceZones,
+      breakOfStructure: computeBOS(cur, lastSwingHigh, lastSwingLow),
+      patterns: detectPatterns(candles, n),
+    };
+  }
+
+  return out;
 }
 
 /** High/low of the most recent *prior* UTC day relative to the last candle. */
@@ -255,11 +394,10 @@ function computeBOS(
   return { bullish, bearish, brokenLevel };
 }
 
-/** Patterns at the last candle of `hist` (uses the current and prior bar). */
-function detectPatterns(hist: Candle[]): CandlePattern[] {
+/** Patterns at candle `n` of `candles` (uses the current and prior bar). */
+function detectPatterns(candles: Candle[], n: number): CandlePattern[] {
   const out: CandlePattern[] = [];
-  const n = hist.length - 1;
-  const cur = hist[n];
+  const cur = candles[n];
   const body = Math.abs(cur.close - cur.open);
   const range = cur.high - cur.low;
   const upperWick = cur.high - Math.max(cur.open, cur.close);
@@ -276,7 +414,7 @@ function detectPatterns(hist: Candle[]): CandlePattern[] {
   }
 
   if (n >= 1) {
-    const prev = hist[n - 1];
+    const prev = candles[n - 1];
     const curBull = cur.close > cur.open;
     const curBear = cur.close < cur.open;
     const prevBull = prev.close > prev.open;

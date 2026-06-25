@@ -15,6 +15,11 @@
 
 import type { Candle, Setup } from "@/lib/types";
 import { detectTrendPullbackAt } from "@/lib/engine/setups/trend-pullback";
+import {
+  precomputeFeatures,
+  type FeatureOptions,
+  type FeatureSet,
+} from "@/lib/engine/features";
 import { evaluateRisk, type RiskContext } from "@/lib/engine/risk";
 
 export type TradeOutcome = "WIN" | "LOSS" | "OPEN";
@@ -56,8 +61,24 @@ export interface BacktestOptions {
    * candles[0..n] (every engine detector does, by slicing internally). Default
    * `detectTrendPullbackAt` — so existing callers and tests are unchanged. Pass
    * another setup's detector to validate it under the same simulation.
+   *
+   * `feature` is the precomputed feature set for bar `n` (see `featureOptions`).
+   * Forward it to the engine detector to skip per-bar feature recomputation; a
+   * detector that ignores it still recomputes fresh and stays correct, just
+   * slower.
    */
-  detect?: (candles: Candle[], n: number) => Setup | null;
+  detect?: (
+    candles: Candle[],
+    n: number,
+    feature?: FeatureSet | null,
+  ) => Setup | null;
+  /**
+   * Feature options used to precompute the shared feature series fed to
+   * `detect`. MUST match the FeatureOptions the detector reads (every engine
+   * detector uses the defaults), or the fed feature would not equal what the
+   * detector would compute itself. Default `{}` (engine defaults).
+   */
+  featureOptions?: FeatureOptions;
 }
 
 export interface BacktestResult {
@@ -165,7 +186,16 @@ export function runBacktest(
   const accountEquity = options.accountEquity ?? 10000;
   const riskPerTradePct = options.riskPerTradePct ?? 1;
   const allowWarning = options.allowWarning ?? true;
-  const detect = options.detect ?? detectTrendPullbackAt;
+  // Default detector: forward the precomputed feature into its 4th param (not
+  // its `options` param, which is the 3rd).
+  const detect =
+    options.detect ?? ((c, n, f) => detectTrendPullbackAt(c, n, {}, f));
+
+  // Precompute the feature series ONCE (incrementally, no lookahead) instead of
+  // recomputing the full feature set per bar inside the detector. feature[n] is
+  // identical to computeFeaturesAt(candles, n, featureOptions) — see the
+  // equivalence test — so detection is unchanged, only faster.
+  const features = precomputeFeatures(candles, options.featureOptions ?? {});
 
   const trades: BacktestTrade[] = [];
   let detected = 0;
@@ -176,8 +206,9 @@ export function runBacktest(
   let openUntil = -1;
 
   for (let n = 0; n < candles.length; n++) {
-    // DETECTION — only ever sees [0..n] (enforced inside the engine).
-    const setup = detect(candles, n);
+    // DETECTION — only ever sees [0..n] (enforced inside the engine). The
+    // precomputed feature[n] is itself a function of candles[0..n] only.
+    const setup = detect(candles, n, features[n]);
     if (!setup) continue;
     detected++;
 

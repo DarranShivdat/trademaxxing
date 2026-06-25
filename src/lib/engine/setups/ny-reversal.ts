@@ -80,9 +80,17 @@ export function detectNyReversalAt(
   candles: Candle[],
   n: number,
   options: NyReversalOptions = {},
+  /**
+   * Optional precomputed feature set for bar `n` (see `precomputeFeatures`). If
+   * omitted it is computed fresh here — so live callers are unchanged. The
+   * backtester passes it to avoid recomputing features per bar. It MUST equal
+   * `computeFeaturesAt(candles, n, options)`; an explicit `null` means "no
+   * feature at this bar" and yields no setup, exactly as a fresh compute would.
+   */
+  feature?: FeatureSet | null,
 ): Setup | null {
   const opts = { ...DEFAULTS, ...options };
-  const f = computeFeaturesAt(candles, n, options);
+  const f = feature === undefined ? computeFeaturesAt(candles, n, options) : feature;
   if (!f) return null;
   if (f.atr14 === null) return null;
 

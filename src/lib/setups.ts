@@ -10,6 +10,7 @@
 // queryable label without re-parsing rawFeatures.
 
 import type { Candle, Setup } from "@/lib/types";
+import type { FeatureSet } from "@/lib/engine/features";
 import { detectTrendPullbackAt } from "@/lib/engine/setups/trend-pullback";
 import { detectBreakoutRetestAt } from "@/lib/engine/setups/breakout-retest";
 import { detectNyReversalAt } from "@/lib/engine/setups/ny-reversal";
@@ -42,8 +43,17 @@ export interface SetupDef {
   /**
    * Run the detector at index `n`. Honors no-lookahead exactly as the engine
    * does (the underlying detector slices to candles[0..n] internally).
+   *
+   * `feature` is an optional precomputed feature set for bar `n` (from
+   * `precomputeFeatures`) — the backtester passes it to skip per-bar
+   * recomputation. Omit it (the live path) and the detector computes fresh.
    */
-  detect: (candles: Candle[], n: number, ctx?: DetectContext) => Setup | null;
+  detect: (
+    candles: Candle[],
+    n: number,
+    ctx?: DetectContext,
+    feature?: FeatureSet | null,
+  ) => Setup | null;
 }
 
 /** Detection order is the order live signals are produced per bar. */
@@ -52,22 +62,22 @@ export const SETUPS: SetupDef[] = [
     tag: "TREND_PULLBACK",
     slug: "trend-pullback",
     label: "Trend Pullback",
-    detect: (candles, n, ctx) =>
-      detectTrendPullbackAt(candles, n, ctx ? { context: ctx } : {}),
+    detect: (candles, n, ctx, feature) =>
+      detectTrendPullbackAt(candles, n, ctx ? { context: ctx } : {}, feature),
   },
   {
     tag: "BREAKOUT_RETEST",
     slug: "breakout-retest",
     label: "Breakout Retest",
-    detect: (candles, n, ctx) =>
-      detectBreakoutRetestAt(candles, n, ctx ? { context: ctx } : {}),
+    detect: (candles, n, ctx, feature) =>
+      detectBreakoutRetestAt(candles, n, ctx ? { context: ctx } : {}, feature),
   },
   {
     tag: "NY_REVERSAL",
     slug: "ny-reversal",
     label: "NY Reversal",
-    detect: (candles, n, ctx) =>
-      detectNyReversalAt(candles, n, ctx ? { context: ctx } : {}),
+    detect: (candles, n, ctx, feature) =>
+      detectNyReversalAt(candles, n, ctx ? { context: ctx } : {}, feature),
   },
 ];
 
