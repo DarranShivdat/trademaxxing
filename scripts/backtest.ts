@@ -18,6 +18,7 @@ config();
 import type { Candle, Timeframe } from "../src/lib/types";
 import { TIMEFRAMES } from "../src/lib/types";
 import { runBacktest } from "../src/lib/backtest/run";
+import type { FeatureSet } from "../src/lib/engine/features";
 import { computeBacktestStats } from "../src/lib/backtest/metrics";
 import { SETUPS, setupBySlug, type SetupDef } from "../src/lib/setups";
 import { prisma } from "../src/lib/db";
@@ -103,9 +104,15 @@ function report(
   timeframe: Timeframe,
   equity: string | undefined,
 ) {
+  // Prefer the setup's stateful scanner (identical signals, scales to long
+  // series); fall back to the stateless per-bar detector. Fresh per run.
+  const detect = def.makeScanner
+    ? def.makeScanner()
+    : (c: Candle[], n: number, f?: FeatureSet | null) =>
+        def.detect(c, n, undefined, f);
   const result = runBacktest(candles, {
     accountEquity: equity ? Number(equity) : undefined,
-    detect: (c, n, f) => def.detect(c, n, undefined, f),
+    detect,
   });
   const stats = computeBacktestStats(result.trades);
 

@@ -12,7 +12,10 @@
 import type { Candle, Setup } from "@/lib/types";
 import type { FeatureSet } from "@/lib/engine/features";
 import { detectTrendPullbackAt } from "@/lib/engine/setups/trend-pullback";
-import { detectBreakoutRetestAt } from "@/lib/engine/setups/breakout-retest";
+import {
+  detectBreakoutRetestAt,
+  createBreakoutRetestScanner,
+} from "@/lib/engine/setups/breakout-retest";
 import { detectNyReversalAt } from "@/lib/engine/setups/ny-reversal";
 
 /** Stable identifier for a setup — matches the engine's `rawFeatures.setup`. */
@@ -54,6 +57,19 @@ export interface SetupDef {
     ctx?: DetectContext,
     feature?: FeatureSet | null,
   ) => Setup | null;
+  /**
+   * Optional factory for a STATEFUL, forward-walking detector used by the
+   * backtester to scale a setup that would otherwise scan history every bar.
+   * Each call returns a fresh detector bound to one series (call it once per
+   * backtest run). It emits BIT-IDENTICAL signals to `detect` at the same bar —
+   * only faster — and REQUIRES the precomputed `feature` for each bar (it does
+   * not recompute features). Setups without one fall back to `detect`.
+   */
+  makeScanner?: () => (
+    candles: Candle[],
+    n: number,
+    feature: FeatureSet | null | undefined,
+  ) => Setup | null;
 }
 
 /** Detection order is the order live signals are produced per bar. */
@@ -71,6 +87,11 @@ export const SETUPS: SetupDef[] = [
     label: "Breakout Retest",
     detect: (candles, n, ctx, feature) =>
       detectBreakoutRetestAt(candles, n, ctx ? { context: ctx } : {}, feature),
+    // Incremental scanner for the backtester: identical signals, O(n) not O(n²).
+    makeScanner: () => {
+      const scanner = createBreakoutRetestScanner();
+      return (candles, n, feature) => scanner.detectAt(candles, n, feature);
+    },
   },
   {
     tag: "NY_REVERSAL",

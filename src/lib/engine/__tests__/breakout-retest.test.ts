@@ -1,8 +1,11 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import type { Candle } from "@/lib/types";
-import { detectBreakoutRetestAt } from "../setups/breakout-retest";
-import { computeFeaturesAt } from "../features";
+import {
+  detectBreakoutRetestAt,
+  createBreakoutRetestScanner,
+} from "../setups/breakout-retest";
+import { computeFeaturesAt, precomputeFeatures } from "../features";
 import { bar, candles } from "./helpers";
 import type { Bar } from "./helpers";
 
@@ -222,6 +225,68 @@ test("REJECT when structure offers no 2R target (no synthetic fallback)", () => 
   for (let n = 0; n < cs.length; n++) {
     assert.equal(detectBreakoutRetestAt(cs, n), null);
   }
+});
+
+/**
+ * A long, structurally rich series (deterministic — no Math.random) that cycles
+ * through up/down drifts with noise, manufacturing many swing highs and lows,
+ * breakouts in both directions, pullbacks, and near-duplicate levels. It grows a
+ * large confirmed-swing list so the candidate set is long — exactly the regime
+ * where the full scan goes quadratic and the incremental scanner must still
+ * agree at every bar (long candidate lists, dedup, and the window stop bound).
+ */
+function richSeries(): Candle[] {
+  const bars: Bar[] = [];
+  let seed = 123456789; // fixed seed → deterministic series.
+  const rng = () => {
+    seed = (seed * 1103515245 + 12345) & 0x7fffffff;
+    return seed / 0x7fffffff;
+  };
+  let price = 100;
+  const drifts = [0.4, -0.3, 0.6, -0.5, 0.2, -0.25, 0.55, -0.6, 0.3, -0.15];
+  for (const drift of drifts) {
+    for (let i = 0; i < 45; i++) {
+      const open = price;
+      price = Math.max(5, price + drift + (rng() - 0.5) * 3);
+      const close = price;
+      bars.push({
+        open,
+        close,
+        high: Math.max(open, close) + rng() * 1.5,
+        low: Math.min(open, close) - rng() * 1.5,
+      });
+    }
+  }
+  return candles(bars);
+}
+
+test("INCREMENTAL SCANNER: bit-identical to the full-scan detector at every bar", () => {
+  const series = [
+    richSeries(),
+    candles(breakoutLongBars()),
+    candles(breakoutLongBars().map(reflect)),
+  ];
+  let totalFired = 0;
+  for (const cs of series) {
+    // Feed BOTH the scanner and the oracle the SAME precomputed feature[n] (the
+    // real backtest path), so the only thing that can differ is HOW candidates
+    // are enumerated — which is precisely what the scanner changes.
+    const feats = precomputeFeatures(cs);
+    const scanner = createBreakoutRetestScanner();
+    for (let n = 0; n < cs.length; n++) {
+      const incremental = scanner.detectAt(cs, n, feats[n]);
+      const fullScan = detectBreakoutRetestAt(cs, n, {}, feats[n]);
+      assert.deepEqual(
+        incremental,
+        fullScan,
+        `incremental scanner diverged from full scan at bar ${n}`,
+      );
+      if (fullScan) totalFired++;
+    }
+  }
+  // Guard against a hollow null===null equivalence: the fixtures must fire, so
+  // firing-path equivalence (the interesting case) is actually exercised.
+  assert.ok(totalFired > 0, "expected the scanner to reproduce real firings");
 });
 
 test("no setup in a clean trend with no broken level + retest", () => {
